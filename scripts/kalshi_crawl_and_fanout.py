@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
-Kalshi crawler + fan-out publisher (AUTO-CREATE repos) — rate-limit safe edition
+Kalshi crawler + fan-out publisher (AUTO-CREATE repos) — STREAMING PUSH edition
 
-Fixes
-- Avoid GitHub API rate-limit by caching repo existence/creation checks.
-  Previously, ensure_repo() could be called per item during FULL crawl.
-- Add simple GitHub rate-limit backoff when API returns 403 with rate-limit message.
+Why this exists
+- Kalshi /markets can be millions of rows. GitHub Actions runner disk is small.
+- Staging ALL json files locally (.work/stage) will inevitably crash with "No space left on device".
 
-Behavior
-- Auto-creates target repos if missing:
-  - Current: Statground_Data_Kalshi_Current
-  - Years:   Statground_Data_Kalshi_<YEAR> (created on demand)
-  - Unknown: Statground_Data_Kalshi_unknown (only if year cannot be parsed)
-- Fan-out rules:
-  - series + open events/markets -> Current repo
-  - closed events/markets -> Year repo by year extracted from relpath
+What changed vs stage-based version
+- No staging directory.
+- Clone only a small number of target repos at a time (LRU cache).
+- Write JSON directly into the checked-out repo working tree.
+- Commit+push in batches (default 5,000 files) to keep disk usage bounded.
+- FULL crawl is resumable via cursor checkpoints (events/markets).
+
+Fan-out rules
+- series + open events/markets -> Current repo (Statground_Data_Kalshi_Current)
+- closed events/markets -> Year repo by year extracted from relpath (Statground_Data_Kalshi_<YYYY>)
+- unknown year -> Statground_Data_Kalshi_unknown
 """
 
 import os, re, json, time, datetime, shutil, subprocess
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+from collections import OrderedDict
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# -------------------------
-# Config
-# -------------------------
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
 NOW_UTC = datetime.datetime.now(datetime.timezone.utc)
 
@@ -37,13 +37,17 @@ STATE_FILE = STATE_DIR / "kalshi_state.json"
 TARGETS_FILE = STATE_DIR / "kalshi_targets.json"
 
 WORK_DIR = ORCH_ROOT / ".work"
-STAGE_DIR = WORK_DIR / "stage"
+REPOS_DIR = WORK_DIR / "repos"
 
 LIMITS = {"events": 200, "markets": 1000}
 EVENTS_BASE_PARAMS = {"with_nested_markets": "true"}
 
 LOG_EVERY = int(os.getenv("KALSHI_LOG_EVERY", "50"))
-SLEEP_SEC = float(os.getenv("KALSHI_SLEEP_SEC", "0.05"))
+SLEEP_SEC = float(os.getenv("KALSHI_SLEEP_SEC", "0.02"))
+
+COMMIT_EVERY_FILES = int(os.getenv("KALSHI_COMMIT_EVERY_FILES", "5000"))
+MAX_OPEN_REPOS = int(os.getenv("KALSHI_MAX_OPEN_REPOS", "3"))
+GIT_PUSH_EVERY_SEC = int(os.getenv("KALSHI_GIT_PUSH_EVERY_SEC", "0"))  # 0=only by files
 
 EVENT_BACKFILL_SEC = int(os.getenv("KALSHI_EVENT_BACKFILL_SEC", "172800"))
 MARKET_BACKFILL_SEC = int(os.getenv("KALSHI_MARKET_BACKFILL_SEC", "120"))
@@ -58,9 +62,6 @@ GIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "github-actions[bot]@users.nore
 GITHUB_API = "https://api.github.com"
 DEFAULT_VISIBILITY_PRIVATE = False
 
-# -------------------------
-# HTTP sessions
-# -------------------------
 def make_session():
     s = requests.Session()
     retry = Retry(
@@ -96,7 +97,6 @@ def gh_backoff_if_rate_limited(resp: requests.Response):
     txt = (resp.text or "").lower()
     if "rate limit exceeded" not in txt:
         return
-
     reset = resp.headers.get("x-ratelimit-reset")
     remaining = resp.headers.get("x-ratelimit-remaining")
     try:
@@ -127,9 +127,6 @@ def gh_post(url: str, payload: dict) -> requests.Response:
         r = SESSION.post(url, headers=gh_headers(), json=payload, timeout=60)
     return r
 
-# -------------------------
-# Utils
-# -------------------------
 def sanitize(s):
     return re.sub(r"_+", "_", re.sub(r"[^\w\-.]+", "_", str(s)))[:180]
 
@@ -160,7 +157,7 @@ def pick_ticker(o, keys):
             return sanitize(o[k])
     return sanitize(abs(hash(json.dumps(o, sort_keys=True))))
 
-def write_json(path: Path, obj):
+def atomic_write_json(path: Path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -171,23 +168,26 @@ def rm_rf(p: Path):
     if p.exists():
         shutil.rmtree(p)
 
-# -------------------------
-# State / Targets
-# -------------------------
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.load(open(STATE_FILE, "r", encoding="utf-8"))
     return {
         "last_run_ts": None,
         "last_market_updated_ts": None,
-        "last_success_utc": None,
         "first_full_done": False,
+        "events_cursor": None,
+        "events_page": 0,
+        "events_total": 0,
+        "markets_cursor": None,
+        "markets_page": 0,
+        "markets_total": 0,
     }
 
 def save_state(state: dict):
     state = dict(state)
     state["last_success_utc"] = NOW_UTC.isoformat()
-    write_json(STATE_FILE, state)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(STATE_FILE, state)
 
 def default_targets() -> dict:
     owner = os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
@@ -207,14 +207,12 @@ def load_targets() -> dict:
     return default_targets()
 
 def save_targets(targets: dict):
-    write_json(TARGETS_FILE, targets)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(TARGETS_FILE, targets)
 
-# -------------------------
-# GitHub repo auto-create (CACHED)
-# -------------------------
 _owner_type_cache: Dict[str, str] = {}
 _repo_exists_cache: Dict[Tuple[str, str], bool] = {}
-_repo_ensured: set = set()  # (owner, repo)
+_repo_ensured: set = set()
 
 def gh_owner_type(owner: str) -> str:
     if owner in _owner_type_cache:
@@ -273,9 +271,6 @@ def ensure_repo(owner: str, repo: str, description: str):
     gh_create_repo(owner, repo, description)
     _repo_ensured.add(k)
 
-# -------------------------
-# Path mapping (Kalshi style)
-# -------------------------
 def series_relpath(o) -> Path:
     cat = sanitize((o.get("category") or "uncategorized").lower())
     sub = sanitize((o.get("subcategory") or "uncategorized").lower())
@@ -313,20 +308,111 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
         return infer_year_repo(targets, rel.parts[2])
     return targets["current_repo"]
 
-# -------------------------
-# Crawl
-# -------------------------
+def run(cmd, cwd=None, check=True):
+    if cmd[:2] != ["git", "status"]:
+        print(f"$ {' '.join(cmd)}")
+    return subprocess.run(cmd, cwd=cwd, check=check)
+
+def repo_remote_url(owner: str, repo: str) -> str:
+    return f"https://x-access-token:{GH_PAT}@github.com/{owner}/{repo}.git"
+
+def git_config_identity(repo_path: Path):
+    run(["git", "config", "user.name", GIT_AUTHOR_NAME], cwd=repo_path)
+    run(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_path)
+
+def git_commit_push_if_changed(repo_path: Path, msg: str):
+    run(["git", "add", "-A"], cwd=repo_path)
+    r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_path)
+    if r.returncode == 0:
+        return False
+    run(["git", "commit", "-m", msg], cwd=repo_path)
+    run(["git", "push"], cwd=repo_path)
+    return True
+
+class RepoWriter:
+    def __init__(self, owner: str, repo: str, local_path: Path):
+        self.owner = owner
+        self.repo = repo
+        self.local_path = local_path
+        self.files_since_commit = 0
+        self.last_push_ts = time.time()
+
+    def open(self):
+        rm_rf(self.local_path)
+        self.local_path.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", "--depth", "1", repo_remote_url(self.owner, self.repo), str(self.local_path)])
+        git_config_identity(self.local_path)
+
+    def write(self, rel: Path, obj: dict):
+        out = self.local_path / rel
+        atomic_write_json(out, obj)
+        self.files_since_commit += 1
+
+    def maybe_flush(self, force=False):
+        if not self.local_path.exists():
+            return
+        do_by_files = self.files_since_commit >= COMMIT_EVERY_FILES
+        do_by_time = (GIT_PUSH_EVERY_SEC > 0) and ((time.time() - self.last_push_ts) >= GIT_PUSH_EVERY_SEC)
+        if force or do_by_files or do_by_time:
+            changed = git_commit_push_if_changed(
+                self.local_path,
+                f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})"
+            )
+            if changed:
+                self.last_push_ts = time.time()
+            self.files_since_commit = 0
+
+    def close(self):
+        self.maybe_flush(force=True)
+        rm_rf(self.local_path)
+
+class WriterManager:
+    def __init__(self, owner: str):
+        self.owner = owner
+        self.writers = OrderedDict()
+
+    def get(self, repo: str) -> RepoWriter:
+        if repo in self.writers:
+            self.writers.move_to_end(repo)
+            return self.writers[repo]
+
+        while len(self.writers) >= MAX_OPEN_REPOS:
+            old_repo, old_writer = self.writers.popitem(last=False)
+            print(f"🧹 Closing LRU repo worktree: {old_repo}")
+            old_writer.close()
+
+        local = REPOS_DIR / repo
+        w = RepoWriter(self.owner, repo, local)
+        print(f"📦 Opening repo worktree: {repo}")
+        w.open()
+        self.writers[repo] = w
+        return w
+
+    def flush_all(self):
+        for repo, w in list(self.writers.items()):
+            print(f"🚀 Flushing repo: {repo}")
+            w.maybe_flush(force=True)
+
+    def close_all(self):
+        for repo, w in list(self.writers.items()):
+            print(f"🧹 Closing repo: {repo}")
+            w.close()
+        self.writers.clear()
+
 def crawl_series_all(yield_item) -> int:
-    data = requests.get(f"{BASE_URL}/series", timeout=60).json()
+    data = kalshi_get_json("/series", params={})
     items = data.get("series", [])
     for o in items:
         yield_item(series_relpath(o), o)
     return len(items)
 
-def crawl_events_full(yield_item) -> int:
-    cursor = None
-    page = 0
-    total = 0
+def crawl_events_full(yield_item, state: dict) -> int:
+    cursor = state.get("events_cursor")
+    page = int(state.get("events_page") or 0)
+    total = int(state.get("events_total") or 0)
+
+    print(f"▶ [events:full] resume page={page:,} cursor={'YES' if cursor else 'NO'} total={total:,}")
+
     while True:
         params = dict(EVENTS_BASE_PARAMS)
         params["limit"] = LIMITS["events"]
@@ -335,25 +421,41 @@ def crawl_events_full(yield_item) -> int:
         data = kalshi_get_json("/events", params=params)
         items = data.get("events", [])
         next_cursor = data.get("cursor")
+
         if not items and not next_cursor:
             break
+
         for o in items:
             yield_item(events_relpath(o), o)
+
         total += len(items)
         page += 1
+        cursor = next_cursor
+
+        state["events_cursor"] = cursor
+        state["events_page"] = page
+        state["events_total"] = total
+        save_state(state)
+
         if page % LOG_EVERY == 0:
             print(f"[events:full] page={page:,} total={total:,}")
-        cursor = next_cursor
+
         if not cursor:
             break
+
         time.sleep(SLEEP_SEC)
+
+    state["events_cursor"] = None
+    save_state(state)
     return total
 
 def crawl_markets_full(yield_item, state: dict) -> int:
-    cursor = None
-    page = 0
-    total = 0
-    max_seen_updated = state.get("last_market_updated_ts") or 0
+    cursor = state.get("markets_cursor")
+    page = int(state.get("markets_page") or 0)
+    total = int(state.get("markets_total") or 0)
+    max_seen_updated = int(state.get("last_market_updated_ts") or 0)
+
+    print(f"▶ [markets:full] resume page={page:,} cursor={'YES' if cursor else 'NO'} total={total:,}")
 
     while True:
         params = {"limit": LIMITS["markets"]}
@@ -362,83 +464,43 @@ def crawl_markets_full(yield_item, state: dict) -> int:
         data = kalshi_get_json("/markets", params=params)
         items = data.get("markets", [])
         next_cursor = data.get("cursor")
+
         if not items and not next_cursor:
             break
+
         for o in items:
             yield_item(markets_relpath(o), o)
             u = iso_to_unix_seconds(o.get("updated_time"))
             if u and u > max_seen_updated:
                 max_seen_updated = u
+
         total += len(items)
         page += 1
+        cursor = next_cursor
+
+        state["markets_cursor"] = cursor
+        state["markets_page"] = page
+        state["markets_total"] = total
+        state["last_market_updated_ts"] = max_seen_updated
+        save_state(state)
+
         if page % LOG_EVERY == 0:
             print(f"[markets:full] page={page:,} total={total:,}")
-        cursor = next_cursor
+
         if not cursor:
             break
+
         time.sleep(SLEEP_SEC)
 
-    state["last_market_updated_ts"] = int(max_seen_updated) if max_seen_updated else int(NOW_UTC.timestamp())
+    state["markets_cursor"] = None
+    state["last_market_updated_ts"] = max_seen_updated or int(NOW_UTC.timestamp())
+    save_state(state)
     return total
 
-# -------------------------
-# Git push helpers
-# -------------------------
-def run(cmd, cwd=None):
-    print(f"$ {' '.join(cmd)}")
-    subprocess.run(cmd, cwd=cwd, check=True)
-
-def clone_repo(owner: str, repo: str, dest: Path):
-    if dest.exists():
-        shutil.rmtree(dest)
-    url = f"https://x-access-token:{GH_PAT}@github.com/{owner}/{repo}.git"
-    run(["git", "clone", "--depth", "1", url, str(dest)])
-
-def sync_tree(src: Path, dst: Path):
-    for p in src.rglob("*"):
-        if p.is_dir():
-            continue
-        rel = p.relative_to(src)
-        out = dst / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, out)
-
-def write_counts(repo_dir: Path) -> dict:
-    counts = {"series": 0, "events_open": 0, "events_closed": 0, "markets_open": 0, "markets_closed": 0, "files_total": 0}
-    for p in repo_dir.rglob("*.json"):
-        rp = p.relative_to(repo_dir).as_posix()
-        counts["files_total"] += 1
-        if rp.startswith("series/"):
-            counts["series"] += 1
-        elif rp.startswith("events/open/"):
-            counts["events_open"] += 1
-        elif rp.startswith("events/closed/"):
-            counts["events_closed"] += 1
-        elif rp.startswith("markets/open/"):
-            counts["markets_open"] += 1
-        elif rp.startswith("markets/closed/"):
-            counts["markets_closed"] += 1
-    counts["generated_utc"] = NOW_UTC.isoformat()
-    return counts
-
-def commit_push_if_changed(repo_path: Path, msg: str):
-    run(["git", "config", "user.name", GIT_AUTHOR_NAME], cwd=repo_path)
-    run(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_path)
-    run(["git", "add", "-A"], cwd=repo_path)
-    r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_path)
-    if r.returncode == 0:
-        print("No changes to commit.")
-        return
-    run(["git", "commit", "-m", msg], cwd=repo_path)
-    run(["git", "push"], cwd=repo_path)
-
-# -------------------------
-# Main
-# -------------------------
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    REPOS_DIR.mkdir(parents=True, exist_ok=True)
 
     state = load_state()
     targets = load_targets()
@@ -448,48 +510,53 @@ def main():
     targets.setdefault("current_repo", "Statground_Data_Kalshi_Current")
     targets.setdefault("year_repos", {})
 
-    # Ensure current repo once
+    print(f"▶ Kalshi fan-out crawler | owner={owner}")
+    print(f"▶ base_url={BASE_URL}")
+    print(f"▶ commit_every_files={COMMIT_EVERY_FILES} max_open_repos={MAX_OPEN_REPOS}")
+
     ensure_repo(owner, targets["current_repo"], "Kalshi current snapshot (series + open events/markets)")
 
-    # IMPORTANT: ensure_repo() is now cached, so calling it per item is safe.
+    wm = WriterManager(owner)
+
     def yield_item(rel: Path, obj: dict):
         repo = target_repo_for_relpath(rel, targets)
         ensure_repo(owner, repo, "Kalshi data repo (auto-created)")
-        out = STAGE_DIR / repo / rel
-        write_json(out, obj)
+        w = wm.get(repo)
+        w.write(rel, obj)
+        w.maybe_flush(force=False)
 
     first_run = not state.get("first_full_done")
-    print(f"▶ Kalshi fan-out crawler | owner={owner}")
-    print(f"▶ mode={'FULL(first run)' if first_run else 'FULL(retry)'}")
-    print(f"▶ base_url={BASE_URL}")
+    print(f"▶ mode={'FULL(first run)' if first_run else 'FULL(resume/refresh)'}")
 
-    n_series = crawl_series_all(yield_item)
-    print(f"✅ series: {n_series:,}")
+    try:
+        n_series = crawl_series_all(yield_item)
+        print(f"✅ series: {n_series:,}")
 
-    n_events = crawl_events_full(yield_item)
-    print(f"✅ events(full): {n_events:,}")
+        n_events = crawl_events_full(yield_item, state)
+        print(f"✅ events(full): {n_events:,}")
 
-    n_markets = crawl_markets_full(yield_item, state)
-    print(f"✅ markets(full): {n_markets:,}")
+        n_markets = crawl_markets_full(yield_item, state)
+        print(f"✅ markets(full): {n_markets:,}")
 
-    state["first_full_done"] = True
-    state["last_run_ts"] = int(NOW_UTC.timestamp())
-    save_state(state)
-    save_targets(targets)
+        wm.flush_all()
 
-    staged_repos = [p.name for p in STAGE_DIR.iterdir() if p.is_dir()]
-    print(f"▶ staged repos: {staged_repos}")
+        state["first_full_done"] = True
+        state["last_run_ts"] = int(NOW_UTC.timestamp())
+        save_state(state)
 
-    for repo in staged_repos:
-        ensure_repo(owner, repo, "Kalshi data repo (auto)")
-        src = STAGE_DIR / repo
-        local = WORK_DIR / "repos" / repo
-        clone_repo(owner, repo, local)
-        sync_tree(src, local)
-        write_json(local / "KALSHI_COUNTS.json", write_counts(local))
-        commit_push_if_changed(local, f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})")
+        save_targets(targets)
 
-    print("🎉 DONE – fan-out crawl complete (rate-limit safe)")
+        atomic_write_json(ORCH_ROOT / "manifest.json", {
+            "base_url": BASE_URL,
+            "mode": "fanout_streaming_push",
+            "last_run_utc": NOW_UTC.isoformat(),
+            "commit_every_files": COMMIT_EVERY_FILES,
+            "max_open_repos": MAX_OPEN_REPOS,
+        })
+
+        print("🎉 DONE – fan-out crawl complete (streaming push)")
+    finally:
+        wm.close_all()
 
 if __name__ == "__main__":
     main()
