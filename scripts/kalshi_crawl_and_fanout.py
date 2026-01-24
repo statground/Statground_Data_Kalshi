@@ -551,22 +551,28 @@ def main():
                      f"{progress['total']:,}", f"{progress['series']:,}", f"{progress['events']:,}", f"{progress['markets']:,}")
             progress["last_print"] = progress["total"]
 
-    def yield_item(rel: Path, obj: dict):
-    # Route series to dedicated repo (series count is small)
+    def yield_item(relpath_str: str, obj: dict):
+    relpath = Path(relpath_str)
+
+    # Route series to dedicated repo
     if relpath.parts and relpath.parts[0] == "series":
         repo = SERIES_REPO
-        repo = target_repo_for_relpath(rel, targets)
-        ensure_repo(owner, repo, "Kalshi data repo (auto-created)")
-        w = wm.get(repo)
-        w.write(rel, obj)
-        w.maybe_flush(False)
-        kind = rel.parts[0]
-        if kind in progress: progress[kind] += 1
-        progress["total"] += 1
-        maybe_print_progress(False)
+    else:
+        repo = repo_for_relpath(relpath)
 
-    first_run = not state.get("first_full_done")
-    log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
+    ensure_repo(owner, repo, "Kalshi archive (auto-created)")
+
+    w = worktrees.get(repo)
+    if w is None:
+        w = open_repo_worktree(repo)
+        worktrees[repo] = w
+
+    out = w.local_path / relpath
+    write_json(out, obj)
+
+    w.files_written += 1
+    w.maybe_flush(False)
+
 
     try:
         n_series = crawl_series_all(yield_item); log.info("series done: %s", f"{n_series:,}"); maybe_print_progress(True)
