@@ -302,7 +302,7 @@ def series_relpath(o) -> Path:
 OPEN_STATUSES = {"open", "active", "trading", "live"}
 
 
-def _best_dt(o: dict, keys: list[str]) -> datetime | None:
+def _best_dt(o: dict, keys: list[str]) -> datetime.datetime | None:
     for k in keys:
         dt = _dt_from_any(o.get(k))
         if dt is not None:
@@ -368,7 +368,7 @@ def markets_relpath(o) -> Path:
     return Path("markets") / "closed" / y / m / p2 / f"{t}.json"
 
 
-def _dt_from_any(v) -> datetime | None:
+def _dt_from_any(v) -> datetime.datetime | None:
     """Best-effort parse of Kalshi-ish datetime values.
 
     Accepts:
@@ -408,7 +408,7 @@ def _dt_from_any(v) -> datetime | None:
         return None
 
 
-def _best_dt(o: dict, keys: list[str]) -> datetime | None:
+def _best_dt(o: dict, keys: list[str]) -> datetime.datetime | None:
     for k in keys:
         if k in o and o.get(k) not in (None, ""):
             dt = _dt_from_any(o.get(k))
@@ -421,7 +421,7 @@ def _best_dt(o: dict, keys: list[str]) -> datetime | None:
 _pick_dt = _best_dt
 
 
-def _ym_from_dt(dt: datetime | None) -> tuple[str, str]:
+def _ym_from_dt(dt: datetime.datetime | None) -> tuple[str, str]:
     if dt is None:
         return ("unknown", "unknown")
     return (f"{dt.year:04d}", f"{dt.month:02d}")
