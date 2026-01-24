@@ -511,7 +511,7 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
         year = parts[2]
         if str(year).isdigit():
             # Ensure we always have a dedicated repo per year (older years too)
-            return get_or_make_year_repo(OWNER, str(year), targets)
+            return get_or_make_year_repo(targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER","statground"), str(year), targets)
         # If we couldn't extract a year, keep it in current to avoid ballooning an "unknown" repo.
         return targets.get("current_repo", "Statground_Data_Kalshi_Current")
 
