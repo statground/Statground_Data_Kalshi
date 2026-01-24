@@ -315,10 +315,37 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
     return targets["current_repo"]
 
 def run(cmd, cwd=None, check=True, echo_to_console=False):
+    """Run a command.
+    - Always log command line to logfile
+    - Capture stdout/stderr and append to logfile (DEBUG)
+    - Optionally echo command line to console (INFO)
+    """
     log.debug("$ %s", " ".join(cmd))
     if echo_to_console or VERBOSE_GIT:
         log.info("$ %s", " ".join(cmd))
-    return subprocess.run(cmd, cwd=cwd, check=check)
+
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+    )
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+
+    if out:
+        log.debug("[stdout] %s", out if len(out) < 8000 else out[:8000] + "...(truncated)")
+    if err:
+        log.debug("[stderr] %s", err if len(err) < 8000 else err[:8000] + "...(truncated)")
+
+    if check and p.returncode != 0:
+        # log a concise error line too
+        log.error("Command failed (%s): %s", p.returncode, " ".join(cmd))
+        if err:
+            log.error("stderr (tail): %s", err[-2000:])
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
+
+    return p
 
 def repo_remote_url(owner: str, repo: str) -> str:
     return f"https://x-access-token:{GH_PAT}@github.com/{owner}/{repo}.git"
@@ -328,12 +355,28 @@ def git_config_identity(repo_path: Path):
     run(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_path)
 
 def git_commit_push_if_changed(repo_path: Path, msg: str):
+    # stage
     run(["git", "add", "-A"], cwd=repo_path)
+
+    # if nothing staged, stop
     r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_path)
     if r.returncode == 0:
         return False
+
+    # commit
     run(["git", "commit", "-m", msg], cwd=repo_path)
-    run(["git", "push"], cwd=repo_path)
+
+    # IMPORTANT: actions/checkout may set http.https://github.com/.extraheader (GITHUB_TOKEN).
+    # That can conflict with PAT-based push to other repos. Remove it locally before pushing.
+    try:
+        run(["git", "config", "--local", "--unset-all", "http.https://github.com/.extraheader"], cwd=repo_path, check=False)
+    except Exception:
+        pass
+
+    # Also force-empty extra header for this push to prevent leakage.
+    # (Git supports -c http.extraHeader= to override header for a single command.)
+    run(["git", "-c", "http.extraHeader=", "push"], cwd=repo_path)
+
     return True
 
 class RepoWriter:
