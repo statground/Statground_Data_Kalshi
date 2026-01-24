@@ -15,7 +15,8 @@ Env:
   KALSHI_VERBOSE_GIT=0
 """
 
-import os, re, json, time, datetime, shutil, subprocess, logging
+import os
+import hashlib, re, json, time, datetime, shutil, subprocess, logging
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from collections import OrderedDict
@@ -174,6 +175,18 @@ def pick_ticker(o, keys):
         if o.get(k):
             return sanitize(o[k])
     return sanitize(abs(hash(json.dumps(o, sort_keys=True))))
+
+def shard2(s: str) -> str:
+    """Return a stable 2-char shard key to avoid huge directories on GitHub."""
+    s = sanitize(s)
+    if not s:
+        return "00"
+    # Use first 2 chars if alnum-heavy, else hash for better spread.
+    head = s[:2].lower()
+    if re.match(r"^[a-z0-9]{2}$", head):
+        return head
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()
+    return h[:2]
 
 def atomic_write_json(path: Path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,7 +377,7 @@ def git_commit_push_if_changed(repo_path: Path, msg: str):
         return False
 
     # commit
-    run(["git", "commit", "-m", msg], cwd=repo_path)
+    run(["git", "commit", "--quiet", "-m", msg], cwd=repo_path)
 
     # IMPORTANT: actions/checkout may set http.https://github.com/.extraheader (GITHUB_TOKEN).
     # That can conflict with PAT-based push to other repos. Remove it locally before pushing.
@@ -375,7 +388,29 @@ def git_commit_push_if_changed(repo_path: Path, msg: str):
 
     # Also force-empty extra header for this push to prevent leakage.
     # (Git supports -c http.extraHeader= to override header for a single command.)
-    run(["git", "-c", "http.extraHeader=", "push"], cwd=repo_path)
+    # Push with retries (handles transient network errors and non-fast-forward when jobs overlap)
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            run(["git", "-c", "http.extraHeader=", "push"], cwd=repo_path)
+            last_err = None
+            break
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            err = (e.stderr or "").lower()
+            # Common overlap case: remote has new commits (non-fast-forward)
+            if "non-fast-forward" in err or "failed to push some refs" in err:
+                log.warning("push rejected (non-fast-forward). Attempting pull --rebase then retry (%s/3)...", attempt)
+                run(["git", "-c", "http.extraHeader=", "pull", "--rebase"], cwd=repo_path, check=False)
+            # Transient network/HTTP
+            elif "rpc failed" in err or "connection" in err or "timeout" in err or "http 5" in err:
+                log.warning("push transient error. Sleeping and retrying (%s/3)...", attempt)
+                time.sleep(5 * attempt)
+            else:
+                log.warning("push failed (attempt %s/3). stderr tail: %s", attempt, (e.stderr or "")[-800:])
+                time.sleep(2)
+    if last_err is not None:
+        raise last_err
 
     return True
 
@@ -551,6 +586,20 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        if isinstance(e, subprocess.CalledProcessError):
+            print("\n========== FAILED COMMAND ==========")
+            try:
+                print("CMD:", " ".join(e.cmd) if isinstance(e.cmd, (list, tuple)) else str(e.cmd))
+            except Exception:
+                pass
+            if e.stderr:
+                print("\n--- stderr (tail) ---")
+                print((e.stderr or "")[-4000:])
+            if e.output:
+                print("\n--- stdout (tail) ---")
+                out = e.output if isinstance(e.output, str) else str(e.output)
+                print(out[-2000:])
+            print("===================================\n")
         log.exception("FATAL: %s", e)
         print("\n========== LOG TAIL (last lines) ==========")
         print(tail_file(LOG_FILE, LOG_TAIL_ON_ERROR))
