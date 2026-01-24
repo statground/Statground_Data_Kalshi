@@ -28,6 +28,13 @@ from urllib3.util.retry import Retry
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
 NOW_UTC = datetime.datetime.now(datetime.timezone.utc)
 
+# Fan-out year-repo safety window (prevents creating too many repos accidentally)
+# Only years within [YEAR_REPO_MIN, YEAR_REPO_MAX] will get dedicated repos;
+# others fall back to unknown_repo/current_repo.
+YEAR_REPO_MIN = int(os.getenv('KALSHI_YEAR_REPO_MIN', str(NOW_UTC.year - 4)))
+YEAR_REPO_MAX = int(os.getenv('KALSHI_YEAR_REPO_MAX', str(NOW_UTC.year + 6)))
+
+
 ORCH_ROOT = Path(".")
 STATE_DIR = ORCH_ROOT / ".state"
 STATE_FILE = STATE_DIR / "kalshi_state.json"
@@ -291,6 +298,37 @@ def ensure_repo(owner: str, repo: str, description: str):
     log.info("Creating missing repo: %s/%s", owner, repo)
     gh_create_repo(owner, repo, description)
     _repo_ensured.add(k)
+
+
+def get_or_make_year_repo(owner: str, year: str, targets: dict) -> str:
+    """Return repo name for a given YYYY, creating/updating mapping as needed.
+
+    Safety: to avoid accidental repo explosion, we only create dedicated repos for
+    years within [YEAR_REPO_MIN, YEAR_REPO_MAX]. Outside the window we fall back
+    to unknown_repo (or current_repo).
+    """
+    yr = str(year).strip()
+    if not yr.isdigit():
+        return targets.get('current_repo', 'Statground_Data_Kalshi_Current')
+
+    y = int(yr)
+    if y < YEAR_REPO_MIN or y > YEAR_REPO_MAX:
+        return targets.get('unknown_repo') or targets.get('current_repo', 'Statground_Data_Kalshi_Current')
+
+    targets.setdefault('year_repos', {})
+    repo = targets['year_repos'].get(yr)
+    if not repo:
+        repo = f"Statground_Data_Kalshi_{yr}"
+        targets['year_repos'][yr] = repo
+        # Persist mapping early so a crash mid-run won't lose the new routing table.
+        try:
+            save_targets(targets)
+        except Exception:
+            pass
+
+    # Ensure GitHub repo exists (idempotent; cached).
+    ensure_repo(owner, repo, f"Kalshi closed data snapshot ({yr})")
+    return repo
 
 def series_relpath(o) -> Path:
     cat = sanitize((o.get("category") or "uncategorized").lower())
