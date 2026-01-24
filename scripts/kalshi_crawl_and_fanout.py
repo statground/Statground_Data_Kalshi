@@ -319,6 +319,10 @@ def infer_year_repo(targets: dict, year: str) -> str:
     return targets["year_repos"][yr]
 
 def target_repo_for_relpath(rel: Path, targets: dict) -> str:
+    # series are stored in dedicated repository (small volume, avoids year fan-out noise)
+    if rel.parts and rel.parts[0] == "series":
+        return SERIES_REPO
+
     if rel.parts[0] == "series":
         return targets["current_repo"]
     if len(rel.parts) >= 2 and rel.parts[1] == "open":
@@ -326,7 +330,6 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
     if len(rel.parts) >= 4 and rel.parts[1] == "closed":
         return infer_year_repo(targets, rel.parts[2])
     return targets["current_repo"]
-
 def run(cmd, cwd=None, check=True, echo_to_console=False):
     """Run a command.
     - Always log command line to logfile
@@ -530,7 +533,6 @@ def main():
     targets = load_targets()
 
     owner = targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
-    ensure_repo(owner, SERIES_REPO, "Kalshi series archive (auto-created)")
     targets["owner"] = owner
     targets.setdefault("current_repo", "Statground_Data_Kalshi_Current")
     targets.setdefault("year_repos", {})
@@ -551,28 +553,19 @@ def main():
                      f"{progress['total']:,}", f"{progress['series']:,}", f"{progress['events']:,}", f"{progress['markets']:,}")
             progress["last_print"] = progress["total"]
 
-    def yield_item(relpath_str: str, obj: dict):
-    relpath = Path(relpath_str)
+    def yield_item(rel: Path, obj: dict):
+        repo = target_repo_for_relpath(rel, targets)
+        ensure_repo(owner, repo, "Kalshi data repo (auto-created)")
+        w = wm.get(repo)
+        w.write(rel, obj)
+        w.maybe_flush(False)
+        kind = rel.parts[0]
+        if kind in progress: progress[kind] += 1
+        progress["total"] += 1
+        maybe_print_progress(False)
 
-    # Route series to dedicated repo
-    if relpath.parts and relpath.parts[0] == "series":
-        repo = SERIES_REPO
-    else:
-        repo = repo_for_relpath(relpath)
-
-    ensure_repo(owner, repo, "Kalshi archive (auto-created)")
-
-    w = worktrees.get(repo)
-    if w is None:
-        w = open_repo_worktree(repo)
-        worktrees[repo] = w
-
-    out = w.local_path / relpath
-    write_json(out, obj)
-
-    w.files_written += 1
-    w.maybe_flush(False)
-
+    first_run = not state.get("first_full_done")
+    log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
 
     try:
         n_series = crawl_series_all(yield_item); log.info("series done: %s", f"{n_series:,}"); maybe_print_progress(True)
