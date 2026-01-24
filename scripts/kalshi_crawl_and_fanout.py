@@ -197,7 +197,8 @@ def atomic_write_json(path: Path, obj):
 
 def rm_rf(p: Path):
     if p.exists():
-        shutil.rmtree(p)
+        # Runner can keep temporary git files for a short time.
+        shutil.rmtree(p, ignore_errors=True)
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -297,12 +298,141 @@ def series_relpath(o) -> Path:
     t = pick_ticker(o, ["series_ticker", "ticker", "id"])
     return Path("series") / "by_category" / cat / sub / f"{t}.json"
 
+
+OPEN_STATUSES = {"open", "active", "trading", "live"}
+
+
+def _best_dt(o: dict, keys: list[str]) -> datetime | None:
+    for k in keys:
+        dt = _dt_from_any(o.get(k))
+        if dt is not None:
+            return dt
+    return None
+
+
+# Backward-compatible alias (older revisions used _pick_dt)
+_pick_dt = _best_dt
+
+
 def events_relpath(o) -> Path:
-    t = pick_ticker(o, ["event_ticker", "ticker", "id"])
-    if (o.get("status") or "").lower() == "open":
-        return Path("events") / "open" / f"{t}.json"
-    y, m = parse_ym(o.get("strike_date"))
-    return Path("events") / "closed" / y / m / f"{t}.json"
+    """Shard events by status + YYYY/MM + 2-char prefix to avoid huge git trees."""
+    status = (o.get("status") or "").lower()
+    t = pick_ticker(o, ["ticker", "event_ticker", "id"])
+
+    dt = _best_dt(
+        o,
+        [
+            "strike_date",
+            "close_time",
+            "expiration_time",
+            "settlement_time",
+            "created_time",
+            "created_at",
+            "updated_time",
+            "updated_at",
+        ],
+    )
+    y, m = _ym_from_dt(dt)
+    p2 = _prefix2(t)
+
+    if status in OPEN_STATUSES:
+        return Path("events") / "open" / y / m / p2 / f"{t}.json"
+    return Path("events") / "closed" / y / m / p2 / f"{t}.json"
+
+
+def markets_relpath(o) -> Path:
+    """Shard markets by status + YYYY/MM + 2-char prefix to avoid huge git trees."""
+    status = (o.get("status") or "").lower()
+    t = pick_ticker(o, ["ticker", "market_ticker", "id"])
+
+    # Prefer a stable time for bucketing: close/expiration for closed,
+    # updated/open time for open.
+    dt = _best_dt(
+        o,
+        [
+            "close_time",
+            "expiration_time",
+            "settlement_time",
+            "created_time",
+            "created_at",
+            "updated_time",
+            "updated_at",
+            "strike_date",
+        ],
+    )
+    y, m = _ym_from_dt(dt)
+    p2 = _prefix2(t)
+
+    if status == "open":
+        return Path("markets") / "open" / y / m / p2 / f"{t}.json"
+    return Path("markets") / "closed" / y / m / p2 / f"{t}.json"
+
+
+def _dt_from_any(v) -> datetime | None:
+    """Best-effort parse of Kalshi-ish datetime values.
+
+    Accepts:
+      - ISO8601 strings (with or without Z, with or without timezone)
+      - YYYY-MM-DD strings
+      - unix epoch seconds/milliseconds
+    """
+    if v is None:
+        return None
+    try:
+        # epoch seconds / ms
+        if isinstance(v, (int, float)):
+            ts = float(v)
+            if ts > 10_000_000_000:  # ms
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if not isinstance(v, str):
+            return None
+
+        s = v.strip()
+        if not s:
+            return None
+        # date only
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+        # normalize Z
+        s2 = s.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s2)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _best_dt(o: dict, keys: list[str]) -> datetime | None:
+    for k in keys:
+        if k in o and o.get(k) not in (None, ""):
+            dt = _dt_from_any(o.get(k))
+            if dt is not None:
+                return dt
+    return None
+
+
+# Backward-compatible alias (older revisions used _pick_dt)
+_pick_dt = _best_dt
+
+
+def _ym_from_dt(dt: datetime | None) -> tuple[str, str]:
+    if dt is None:
+        return ("unknown", "unknown")
+    return (f"{dt.year:04d}", f"{dt.month:02d}")
+
+
+def _prefix2(s: str) -> str:
+    """2-char shard key for directory fan-out (keeps git trees small)."""
+    s = sanitize(s)
+    if not s:
+        return "xx"
+    return (s + "x")[:2].lower()
 
 def markets_relpath(o) -> Path:
     t = pick_ticker(o, ["ticker", "market_ticker", "id"])
@@ -341,14 +471,14 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
     # closed/<YYYY>/... routes to year repo
     if len(parts) >= 3 and parts[1] == "closed":
         year = parts[2]
-        year_repos = targets.get("year_repos") or {}
-        repo = year_repos.get(str(year))
-        if repo:
-            return repo
-        # fallback: unknown if year not mapped
-        return targets.get("unknown_repo", "Statground_Data_Kalshi_unknown")
+        if str(year).isdigit():
+            # Ensure we always have a dedicated repo per year (older years too)
+            return get_or_make_year_repo(OWNER, str(year), targets)
+        # If we couldn't extract a year, keep it in current to avoid ballooning an "unknown" repo.
+        return targets.get("current_repo", "Statground_Data_Kalshi_Current")
 
-    return targets.get("unknown_repo", "Statground_Data_Kalshi_unknown")
+    # As a safety net, prefer current repo over an "unknown" bucket
+    return targets.get("current_repo", "Statground_Data_Kalshi_Current")
 
 def run(cmd, cwd=None, check=True, echo_to_console=False):
     """Run a command.
