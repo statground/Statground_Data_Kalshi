@@ -28,13 +28,6 @@ from urllib3.util.retry import Retry
 BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
 NOW_UTC = datetime.datetime.now(datetime.timezone.utc)
 
-# Fan-out year-repo safety window (prevents creating too many repos accidentally)
-# Only years within [YEAR_REPO_MIN, YEAR_REPO_MAX] will get dedicated repos;
-# others fall back to unknown_repo/current_repo.
-YEAR_REPO_MIN = int(os.getenv('KALSHI_YEAR_REPO_MIN', str(NOW_UTC.year - 4)))
-YEAR_REPO_MAX = int(os.getenv('KALSHI_YEAR_REPO_MAX', str(NOW_UTC.year + 6)))
-
-
 ORCH_ROOT = Path(".")
 STATE_DIR = ORCH_ROOT / ".state"
 STATE_FILE = STATE_DIR / "kalshi_state.json"
@@ -299,37 +292,6 @@ def ensure_repo(owner: str, repo: str, description: str):
     gh_create_repo(owner, repo, description)
     _repo_ensured.add(k)
 
-
-def get_or_make_year_repo(owner: str, year: str, targets: dict) -> str:
-    """Return repo name for a given YYYY, creating/updating mapping as needed.
-
-    Safety: to avoid accidental repo explosion, we only create dedicated repos for
-    years within [YEAR_REPO_MIN, YEAR_REPO_MAX]. Outside the window we fall back
-    to unknown_repo (or current_repo).
-    """
-    yr = str(year).strip()
-    if not yr.isdigit():
-        return targets.get('current_repo', 'Statground_Data_Kalshi_Current')
-
-    y = int(yr)
-    if y < YEAR_REPO_MIN or y > YEAR_REPO_MAX:
-        return targets.get('unknown_repo') or targets.get('current_repo', 'Statground_Data_Kalshi_Current')
-
-    targets.setdefault('year_repos', {})
-    repo = targets['year_repos'].get(yr)
-    if not repo:
-        repo = f"Statground_Data_Kalshi_{yr}"
-        targets['year_repos'][yr] = repo
-        # Persist mapping early so a crash mid-run won't lose the new routing table.
-        try:
-            save_targets(targets)
-        except Exception:
-            pass
-
-    # Ensure GitHub repo exists (idempotent; cached).
-    ensure_repo(owner, repo, f"Kalshi closed data snapshot ({yr})")
-    return repo
-
 def series_relpath(o) -> Path:
     cat = sanitize((o.get("category") or "uncategorized").lower())
     sub = sanitize((o.get("subcategory") or "uncategorized").lower())
@@ -371,7 +333,7 @@ def events_relpath(o) -> Path:
         ],
     )
     y, m = _ym_from_dt(dt)
-    p2 = _prefix2(t)
+    p2 = _shard2(t)
 
     if status in OPEN_STATUSES:
         return Path("events") / "open" / y / m / p2 / f"{t}.json"
@@ -399,7 +361,7 @@ def markets_relpath(o) -> Path:
         ],
     )
     y, m = _ym_from_dt(dt)
-    p2 = _prefix2(t)
+    p2 = _shard2(t)
 
     if status == "open":
         return Path("markets") / "open" / y / m / p2 / f"{t}.json"
@@ -465,12 +427,13 @@ def _ym_from_dt(dt: datetime.datetime | None) -> tuple[str, str]:
     return (f"{dt.year:04d}", f"{dt.month:02d}")
 
 
-def _prefix2(s: str) -> str:
-    """2-char shard key for directory fan-out (keeps git trees small)."""
+def _shard2(s: str) -> str:
+    """2-hex shard from SHA1(s). Stable and evenly distributed (avoids huge trees when tickers share prefixes like '2026...')."""
     s = sanitize(s)
     if not s:
-        return "xx"
-    return (s + "x")[:2].lower()
+        return "00"
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()
+    return h[:2]
 
 def markets_relpath(o) -> Path:
     t = pick_ticker(o, ["ticker", "market_ticker", "id"])
@@ -511,7 +474,7 @@ def target_repo_for_relpath(rel: Path, targets: dict) -> str:
         year = parts[2]
         if str(year).isdigit():
             # Ensure we always have a dedicated repo per year (older years too)
-            return get_or_make_year_repo(targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER","statground"), str(year), targets)
+            return get_or_make_year_repo(OWNER, str(year), targets)
         # If we couldn't extract a year, keep it in current to avoid ballooning an "unknown" repo.
         return targets.get("current_repo", "Statground_Data_Kalshi_Current")
 
