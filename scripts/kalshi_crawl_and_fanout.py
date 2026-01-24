@@ -223,12 +223,16 @@ def save_state(state: dict):
 
 def default_targets() -> dict:
     owner = os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
-    y = NOW_UTC.year
     return {
         "owner": owner,
-        "current_repo": "Statground_Data_Kalshi_Current",
         "series_repo": "Statground_Data_Kalshi_Series",
-        "year_repos": {str(y): f"Statground_Data_Kalshi_{y}", str(y+1): f"Statground_Data_Kalshi_{y+1}"},
+        # Split events and markets into separate repositories, and shard
+        # to avoid gigantic working trees and git index growth.
+        "repo_prefix": "Statground_Data_Kalshi",
+        # Keep shard counts small to avoid opening too many repos in one run.
+        # (Markets are huge; events are relatively smaller.)
+        "shards": {"events": int(os.getenv("KALSHI_EVENT_SHARDS", "2")),
+                   "markets": int(os.getenv("KALSHI_MARKET_SHARDS", "4"))},
     }
 
 def load_targets() -> dict:
@@ -281,7 +285,7 @@ def gh_create_repo(owner: str, repo: str, description: str):
         _repo_exists_cache[(owner, repo)] = True
         return
     raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
-def ensure_repo(owner: str, repo: str, description: str):
+def ensure_repo(owner: str, repo: str, description: str = ""):
     k = (owner, repo)
     if k in _repo_ensured:
         return
@@ -289,7 +293,10 @@ def ensure_repo(owner: str, repo: str, description: str):
         _repo_ensured.add(k)
         return
     log.info("Creating missing repo: %s/%s", owner, repo)
-    gh_create_repo(owner, repo, description)
+    # gh repo create requires --description, but we sometimes create repos
+    # dynamically (e.g., sharded buckets) where a verbose description is not
+    # necessary. Use an empty string in that case.
+    gh_create_repo(owner, repo, description or "")
     _repo_ensured.add(k)
 
 def series_relpath(o) -> Path:
@@ -435,58 +442,68 @@ def _shard2(s: str) -> str:
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return h[:2]
 
-def get_or_make_year_repo(owner: str, year: str, targets: dict) -> str:
-    """Return repo name for the given year, creating+registering it if needed.
-
-    targets is the dict returned by build_targets(). We memoize year->repo to avoid
-    repeatedly creating/opening repos while crawling markets.
-    """
-    year_repos = targets.setdefault('year_repos', {})
-    if year in year_repos:
-        return year_repos[year]
-    repo_name = infer_year_repo(targets, year)
-    ensure_repo(owner, repo_name)
-    year_repos[year] = repo_name
-    return repo_name
+def _bucket_from_shard(shard: str, buckets: int) -> str:
+    """Deterministically map a shard folder (e.g., 'a3') to a 001..NNN bucket."""
+    if not shard:
+        return "001"
+    try:
+        n = int(shard[0], 16)
+    except Exception:
+        n = 0
+    idx = (n % max(1, int(buckets))) + 1
+    return f"{idx:03d}"
 
 
-def infer_year_repo(targets: dict, year: str) -> str:
-    yr = str(year)
-    targets.setdefault("year_repos", {})
-    if yr not in targets["year_repos"]:
-        targets["year_repos"][yr] = "Statground_Data_Kalshi_unknown" if yr == "unknown" else f"Statground_Data_Kalshi_{yr}"
-    return targets["year_repos"][yr]
+def _repo_name(prefix: str, kind: str, scope: str, bucket: str) -> str:
+    # kind: 'Events' | 'Markets'
+    # scope: 'Current' | '2026' | 'unknown'
+    return f"{prefix}_{kind}_{scope}_{bucket}"
+
 
 def target_repo_for_relpath(rel: Path, targets: dict) -> str:
-    """Decide target repository for a given relative path.
+    """Route each JSON file to a *sharded* target repository.
 
-    - series/*  -> targets['series_repo'] (small volume, kept separate)
-    - events/* & markets/*:
-        * open/ -> current_repo
-        * closed/YYYY/.. -> year repo based on YYYY
+    Why:
+      - A single repo with >1M files makes `git add -A` / index updates blow up in
+        GitHub Actions (disk space, time).
+
+    Policy:
+      - series/*                        -> one small repo (targets['series_repo'])
+      - events/* and markets/*          -> split by entity AND shard into buckets
+          * open/*                      -> <prefix>_<Kind>_Current_###
+          * closed/<YYYY>/*             -> <prefix>_<Kind>_<YYYY>_###
     """
     parts = rel.parts
+    prefix = targets.get("repo_prefix", "Statground_Data_Kalshi")
+    buckets = targets.get("buckets", {"events": 2, "markets": 4})
+
     if not parts:
-        return targets.get("current_repo", "Statground_Data_Kalshi_Current")
+        return _repo_name(prefix, "Markets", "Current", "001")
 
     if parts[0] == "series":
         return targets.get("series_repo", "Statground_Data_Kalshi_Series")
 
-    # open snapshots go to current repo
-    if len(parts) >= 2 and parts[1] == "open":
-        return targets.get("current_repo", "Statground_Data_Kalshi_Current")
+    if parts[0] not in ("events", "markets"):
+        return _repo_name(prefix, "Markets", "Current", "001")
 
-    # closed/<YYYY>/... routes to year repo
-    if len(parts) >= 3 and parts[1] == "closed":
+    kind = "Events" if parts[0] == "events" else "Markets"
+    bucket_count = int(buckets.get(parts[0], 2))
+
+    # rel scheme: <entity>/<open|closed>/<YYYY>/<MM>/<shard>/<file>.json
+    status = parts[1] if len(parts) >= 2 else "open"
+    year = None
+    shard = None
+
+    if len(parts) >= 3:
         year = parts[2]
-        if str(year).isdigit():
-            # Ensure we always have a dedicated repo per year (older years too)
-            return get_or_make_year_repo(OWNER, str(year), targets)
-        # If we couldn't extract a year, keep it in current to avoid ballooning an "unknown" repo.
-        return targets.get("current_repo", "Statground_Data_Kalshi_Current")
+    if len(parts) >= 5:
+        shard = parts[4]
 
-    # As a safety net, prefer current repo over an "unknown" bucket
-    return targets.get("current_repo", "Statground_Data_Kalshi_Current")
+    bucket = _bucket_from_shard(shard or "", bucket_count)
+    if status == "closed" and year and str(year).isdigit():
+        return _repo_name(prefix, kind, str(year), bucket)
+    # open (or unknown) -> Current
+    return _repo_name(prefix, kind, "Current", bucket)
 
 def run(cmd, cwd=None, check=True, echo_to_console=False):
     """Run a command.
@@ -528,9 +545,19 @@ def git_config_identity(repo_path: Path):
     run(["git", "config", "user.name", GIT_AUTHOR_NAME], cwd=repo_path)
     run(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_path)
 
-def git_commit_push_if_changed(repo_path: Path, msg: str):
+def _chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def git_commit_push_if_changed(repo_path: Path, msg: str, paths: list[str] | None = None):
     # stage
-    run(["git", "add", "-A"], cwd=repo_path)
+    if paths:
+        # Avoid `git add -A` on huge repos; only stage what we wrote.
+        for chunk in _chunked(paths, 4000):
+            run(["git", "add", "--"] + chunk, cwd=repo_path)
+    else:
+        run(["git", "add", "-A"], cwd=repo_path)
 
     # if nothing staged, stop
     r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_path)
@@ -581,6 +608,7 @@ class RepoWriter:
         self.repo = repo
         self.local_path = local_path
         self.files_since_commit = 0
+        self._dirty_paths: list[str] = []
         self.last_push_ts = time.time()
     def open(self):
         rm_rf(self.local_path)
@@ -591,11 +619,20 @@ class RepoWriter:
     def write(self, rel: Path, obj: dict):
         atomic_write_json(self.local_path / rel, obj)
         self.files_since_commit += 1
+        # Track changed file paths so we can "git add" only what we touched,
+        # avoiding an expensive tree-wide scan (git add -A) on huge repos.
+        self._dirty_paths.append(str(rel))
     def maybe_flush(self, force=False):
         do_by_files = self.files_since_commit >= COMMIT_EVERY_FILES
         do_by_time = (GIT_PUSH_EVERY_SEC > 0) and ((time.time() - self.last_push_ts) >= GIT_PUSH_EVERY_SEC)
         if force or do_by_files or do_by_time:
-            changed = git_commit_push_if_changed(self.local_path, f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})")
+            dirty = self._dirty_paths
+            self._dirty_paths = []
+            changed = git_commit_push_if_changed(
+                self.local_path,
+                f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
+                paths=dirty,
+            )
             if changed:
                 self.last_push_ts = time.time()
             self.files_since_commit = 0
@@ -607,10 +644,17 @@ class WriterManager:
     def __init__(self, owner: str):
         self.owner = owner
         self.writers = OrderedDict()
+        self._ensured = set()
     def get(self, repo: str) -> RepoWriter:
         if repo in self.writers:
             self.writers.move_to_end(repo)
             return self.writers[repo]
+
+        # Lazily create repos as we discover new shards/years.
+        if repo not in self._ensured:
+            desc = f"Kalshi data mirror (fan-out) | {repo}"
+            ensure_repo(self.owner, repo, desc)
+            self._ensured.add(repo)
         while len(self.writers) >= MAX_OPEN_REPOS:
             old_repo, old_writer = self.writers.popitem(last=False)
             log.info("Closing LRU repo worktree: %s", old_repo)
@@ -692,17 +736,16 @@ def main():
 
     owner = targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
     targets["owner"] = owner
-    targets.setdefault("current_repo", "Statground_Data_Kalshi_Current")
     targets.setdefault("series_repo", "Statground_Data_Kalshi_Series")
-    targets.setdefault("unknown_repo", "Statground_Data_Kalshi_unknown")
-    targets.setdefault("year_repos", {})
+    targets.setdefault("prefix", "Statground_Data_Kalshi")
+    targets.setdefault("buckets", {"events": int(os.getenv("KALSHI_BUCKETS_EVENTS", "2")),
+                                   "markets": int(os.getenv("KALSHI_BUCKETS_MARKETS", "4"))})
 
     log.info("Kalshi fan-out crawler | owner=%s", owner)
     log.info("base_url=%s", BASE_URL)
     log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
     log.info("logfile=%s", str(LOG_FILE))
 
-    ensure_repo(owner, targets["current_repo"], "Kalshi current snapshot (open events/markets)")
     ensure_repo(owner, targets["series_repo"], "Kalshi series snapshot (auto-created)")
 
     wm = WriterManager(owner)
@@ -716,7 +759,6 @@ def main():
 
     def yield_item(rel: Path, obj: dict):
         repo = target_repo_for_relpath(rel, targets)
-        ensure_repo(owner, repo, "Kalshi data repo (auto-created)")
         w = wm.get(repo)
         w.write(rel, obj)
         w.maybe_flush(False)

@@ -45,6 +45,15 @@ jobs:
         run: |
           python scripts/kalshi_crawl_and_fanout.py
 
+      - name: Generate repo-stats markdown
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KALSHI_OWNER: "statground"
+          KALSHI_PREFIX: "Statground_Data_Kalshi"
+        run: |
+          python scripts/kalshi_generate_repo_stats_md.py
+
       - name: Commit & push orchestrator updates (state/targets/stats)
         run: |
           if git diff --quiet; then
