@@ -435,13 +435,20 @@ def _shard2(s: str) -> str:
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return h[:2]
 
-def markets_relpath(o) -> Path:
-    t = pick_ticker(o, ["ticker", "market_ticker", "id"])
-    status = (o.get("status") or "").lower()
-    if status in ("open", "unopened", "paused") or not o.get("close_time"):
-        return Path("markets") / "open" / f"{t}.json"
-    y, m = parse_ym(o.get("close_time"))
-    return Path("markets") / "closed" / y / m / f"{t}.json"
+def get_or_make_year_repo(owner: str, year: str, targets: dict) -> str:
+    """Return repo name for the given year, creating+registering it if needed.
+
+    targets is the dict returned by build_targets(). We memoize year->repo to avoid
+    repeatedly creating/opening repos while crawling markets.
+    """
+    year_repos = targets.setdefault('year_repos', {})
+    if year in year_repos:
+        return year_repos[year]
+    repo_name = infer_year_repo(targets, year)
+    ensure_repo(owner, repo_name)
+    year_repos[year] = repo_name
+    return repo_name
+
 
 def infer_year_repo(targets: dict, year: str) -> str:
     yr = str(year)
