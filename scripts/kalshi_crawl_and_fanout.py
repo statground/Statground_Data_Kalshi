@@ -530,6 +530,7 @@ def main():
     targets = load_targets()
 
     owner = targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
+    ensure_repo(owner, SERIES_REPO, "Kalshi series archive (auto-created)")
     targets["owner"] = owner
     targets.setdefault("current_repo", "Statground_Data_Kalshi_Current")
     targets.setdefault("year_repos", {})
@@ -551,6 +552,9 @@ def main():
             progress["last_print"] = progress["total"]
 
     def yield_item(rel: Path, obj: dict):
+    # Route series to dedicated repo (series count is small)
+    if relpath.parts and relpath.parts[0] == "series":
+        repo = SERIES_REPO
         repo = target_repo_for_relpath(rel, targets)
         ensure_repo(owner, repo, "Kalshi data repo (auto-created)")
         w = wm.get(repo)
