@@ -27,9 +27,22 @@ def gh_headers() -> Dict[str, str]:
     return h
 
 
+
 def gh_list_repos_by_prefix(owner: str, prefix: str) -> List[str]:
-    url = f"https://api.github.com/users/{owner}/repos?per_page=100&type=owner"
+    """List repos for `owner` whose names start with `prefix`.
+
+    NOTE: The /users/{owner}/repos endpoint only returns PUBLIC repos.
+    Since these data repos are typically PRIVATE, we prefer /user/repos when a token is present.
+    """
+    token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
     out: List[str] = []
+
+    if token:
+        # Authenticated: include private repos owned by the authenticated user
+        url = "https://api.github.com/user/repos?per_page=100&affiliation=owner"
+    else:
+        url = f"https://api.github.com/users/{owner}/repos?per_page=100&type=owner"
+
     while url:
         r = requests.get(url, headers=gh_headers(), timeout=60)
         if r.status_code >= 400:
@@ -48,8 +61,8 @@ def gh_list_repos_by_prefix(owner: str, prefix: str) -> List[str]:
                     next_url = part.split(";")[0].strip()[1:-1]
                     break
         url = next_url
-    return sorted(set(out))
 
+    return sorted(set(out))
 
 def run(cmd: List[str], cwd: str | None = None) -> str:
     p = subprocess.run(cmd, cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

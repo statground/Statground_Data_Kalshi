@@ -255,70 +255,87 @@ _repo_ensured: set = set()
 
 
 
-def target_repo_for_relpath(rel: str, tracker: "RepoRolloverTracker", targets: dict) -> str:
-    """Choose which GitHub repo should receive a file based on its relative path."""
-    # Some helpers may pass a pathlib.Path; normalize before string operations.
-    if isinstance(rel, Path):
-        rel = rel.as_posix()
-    else:
+
+def target_repo_for_relpath(rel, tracker: "RepoRolloverTracker", targets: dict):
+    """Return (repo, kind, scope) for a given relative path."""
+    if not isinstance(rel, str):
         rel = str(rel)
+    rel = rel.lstrip("/")
 
-    # Normalize leading separators.
-    while rel.startswith("/"):
-        rel = rel[1:]
+    # Series always lives in a single repo
     if rel.startswith("series/"):
-        return targets["series_repo"]
+        return targets["series_repo"], "Series", "All"
 
-    parts = rel.split("/")
-    if not parts:
-        return targets["series_repo"]
+    # Events: events/{open|closed}/YYYY/... OR events/{open|closed}/unknown/...
+    if rel.startswith("events/"):
+        parts = rel.split("/")
+        year = parts[2] if len(parts) > 2 else "unknown"
+        scope = "Current" if year in ("unknown", "current") else year
+        return tracker.repo("Events", scope), "Events", scope
 
-    # events/{open|closed}/{YYYY|unknown}/...
-    if parts[0] == "events":
-        scope = parts[2] if len(parts) >= 3 and re.fullmatch(r"\d{4}", parts[2] or "") else "Current"
-        return tracker.repo("Events", scope)
+    # Markets: markets/{open|closed}/YYYY/... OR markets/{open|closed}/unknown/...
+    if rel.startswith("markets/"):
+        parts = rel.split("/")
+        year = parts[2] if len(parts) > 2 else "unknown"
+        scope = "Current" if year in ("unknown", "current") else year
+        return tracker.repo("Markets", scope), "Markets", scope
 
-    # markets/{open|closed}/{YYYY|unknown}/...
-    if parts[0] == "markets":
-        scope = parts[2] if len(parts) >= 3 and re.fullmatch(r"\d{4}", parts[2] or "") else "Current"
-        return tracker.repo("Markets", scope)
-
-    # Fallback: treat as Events_Current (keeps unknowns together)
-    return tracker.repo("Events", "Current")
+    # Fallback: keep unknowns with Events_Current
+    return tracker.repo("Events", "Current"), "Events", "Current"
 
 
 class RepoRolloverTracker:
-    """Tracks which {NNN} repo suffix is active per (kind, scope). Persisted in state.
+    """Decides which numbered repo (_001, _002, ...) to write into.
 
-    kind: 'Events' | 'Markets'
-    scope: 'Current' | 'YYYY' | 'unknown'
+    Rollover triggers (any of):
+      - per-repo JSON file count reaches MAX_FILES_PER_REPO
+      - tracked bytes reaches MAX_BYTES_PER_REPO
+      - free disk on the runner under WORK_DIR drops below MIN_FREE_GB
+
+    We track counts in the state file so restarts keep using the same suffix.
     """
-    def __init__(self, targets: dict, state: dict):
-        self.targets = targets
-        self.state = state
-        self.prefix = targets.get("repo_prefix", "Statground_Data_Kalshi")
-        # state["rollover"] stores current indices
-        self.state.setdefault("rollover", {})  # e.g. {"Events:Current": 1, "Markets:2026": 2}
+
+    def __init__(self, repo_prefix: str, state: dict):
+        self.repo_prefix = repo_prefix
+        self.state = state.setdefault("rollover", {})
+        self.suffix_width = int(ROLLOVER_SUFFIX_WIDTH)
 
     def _key(self, kind: str, scope: str) -> str:
         return f"{kind}:{scope}"
 
-    def index(self, kind: str, scope: str) -> int:
-        return int(self.state["rollover"].get(self._key(kind, scope), 1))
-
-    def bump(self, kind: str, scope: str) -> int:
+    def _get_entry(self, kind: str, scope: str) -> dict:
         k = self._key(kind, scope)
-        i = int(self.state["rollover"].get(k, 1)) + 1
-        self.state["rollover"][k] = i
-        return i
+        ent = self.state.get(k)
+        if not ent:
+            ent = {"idx": 1, "files": 0, "bytes": 0}
+            self.state[k] = ent
+        return ent
+
+    def _repo_name(self, kind: str, scope: str, idx: int) -> str:
+        return f"{self.repo_prefix}_{kind}_{scope}_{idx:0{self.suffix_width}d}"
 
     def repo(self, kind: str, scope: str) -> str:
-        # series is a singleton
-        if kind == "Series" or scope == "Series":
-            return self.targets.get("series_repo", f"{self.prefix}_Series")
-        i = self.index(kind, scope)
-        return f"{self.prefix}_{kind}_{scope}_{i:03d}"
+        ent = self._get_entry(kind, scope)
 
+        # Disk-based rollover (runner safety)
+        if disk_free_gb(WORK_DIR) < float(MIN_FREE_GB):
+            ent["idx"] += 1
+            ent["files"] = 0
+            ent["bytes"] = 0
+
+        # Repo-size rollover (approx via counters)
+        if ent["files"] >= int(MAX_FILES_PER_REPO) or ent["bytes"] >= int(MAX_BYTES_PER_REPO):
+            ent["idx"] += 1
+            ent["files"] = 0
+            ent["bytes"] = 0
+
+        # Reserve one slot for the next file
+        ent["files"] += 1
+        return self._repo_name(kind, scope, ent["idx"])
+
+    def record_bytes(self, kind: str, scope: str, nbytes: int):
+        ent = self._get_entry(kind, scope)
+        ent["bytes"] += int(nbytes)
 def gh_owner_type(owner: str) -> str:
     if owner in _owner_type_cache:
         return _owner_type_cache[owner]
@@ -679,10 +696,13 @@ class RepoWriter:
         self.open()
         p = Path(self.local_path) / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
+
         data = json.dumps(obj, ensure_ascii=False, indent=(2 if pretty else None), sort_keys=False)
-        p.write_text(data + "\n", encoding="utf-8")
+        raw = (data + "\n").encode("utf-8")
+        p.write_bytes(raw)
         self.files_written += 1
         self._pending_paths.append(relpath)
+        return len(raw)
 
     def maybe_flush(self, force: bool):
         # Flush when we have enough pending files or on force.
@@ -774,7 +794,7 @@ class WriterManager:
                 log.info("Closing repo: %s", evict_repo)
                 w.close()
 
-        local_path = os.path.join(WORK_REPOS_DIR, repo)
+        local_path = str(REPOS_DIR / repo)
         w = RepoWriter(self.owner, repo, local_path, self.tracker)
         w.open()
         self.writers[repo] = w
@@ -859,90 +879,65 @@ def crawl_markets_full(yield_item, state: dict) -> int:
     save_state(state)
     return total
 
+
 def main():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    REPOS_DIR.mkdir(parents=True, exist_ok=True)
-
+    log = get_logger()
     state = load_state()
-    targets = load_targets()
 
-    owner = targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
-    targets["owner"] = owner
-    targets.setdefault("repo_prefix", "Statground_Data_Kalshi")
-    targets.setdefault("series_repo", f"{targets['repo_prefix']}_Series")
+    owner = os.environ.get("GH_OWNER", "statground")
+    repo_prefix = os.environ.get("REPO_PREFIX", "Statground_Data_Kalshi")
 
+    targets = {
+        "repo_prefix": repo_prefix,
+        "series_repo": f"{repo_prefix}_Series",
+        "events_current_base": f"{repo_prefix}_Events_Current",
+        "markets_current_base": f"{repo_prefix}_Markets_Current",
+        "events_year_base": f"{repo_prefix}_Events",
+        "markets_year_base": f"{repo_prefix}_Markets",
+    }
+
+    tracker = RepoRolloverTracker(repo_prefix, state)
+    wm = WriterManager(owner, tracker)
+
+    def yield_item(rel, obj):
+        # rel may be Path
+        rel_str = str(rel).lstrip("/")
+        repo, kind, scope = target_repo_for_relpath(rel_str, tracker, targets)
+        w = wm.get(repo)
+        nbytes = w.write_json(rel_str, obj) or 0
+        tracker.record_bytes(kind, scope, nbytes)
+        w.maybe_flush(force=False)
+
+    first_run = not bool(state.get("first_full_done"))
     log.info("Kalshi fan-out crawler | owner=%s", owner)
     log.info("base_url=%s", BASE_URL)
     log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
-    log.info("logfile=%s", str(LOG_FILE))
-
-    ensure_repo(owner, targets["series_repo"], "Kalshi series snapshot (auto-created)")
-
-    tracker = RepoRolloverTracker(targets, state)
-    wm = WriterManager(owner, tracker)
-    progress = {"series": 0, "events": 0, "markets": 0, "total": 0, "last_print": 0}
-
-    def maybe_print_progress(force=False):
-        if force or (progress["total"] - progress["last_print"] >= PRINT_EVERY_ITEMS):
-            log.info("progress total=%s (series=%s, events=%s, markets=%s)",
-                     f"{progress['total']:,}", f"{progress['series']:,}", f"{progress['events']:,}", f"{progress['markets']:,}")
-            progress["last_print"] = progress["total"]
-
-    def yield_item(rel: Path, obj: dict):
-        nonlocal tracker
-        repo = target_repo_for_relpath(rel, tracker, targets)
-
-        while True:
-            w = wm.get(repo)
-            try:
-                w.write_json(str(rel), obj)
-                w.maybe_flush(False)
-                break
-            except RolloverRequested:
-                # Close and advance to next repo index for this (kind, scope)
-                kind, scope = w.kind, w.scope
-                log.warning("[rollover] triggered for %s (kind=%s scope=%s). Switching repo index.", repo, kind, scope)
-                w.close()
-                # remove writer from manager
-                wm.writers.pop(repo, None)
-                if repo in wm.open_order:
-                    wm.open_order.remove(repo)
-                if kind != "Series":
-                    tracker.bump(kind, scope)
-                    repo = tracker.repo(kind, scope)
-                else:
-                    # should never happen, but avoid infinite loops
-                    raise
-
-        kind0 = rel.parts[0]
-        if kind0 in progress:
-            progress[kind0] += 1
-        progress["total"] += 1
-        maybe_print_progress(False)
-
-    first_run = not state.get("first_full_done")
+    log.info("logfile=%s", LOG_FILE)
     log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
 
     try:
-        n_series = crawl_series_all(yield_item); log.info("series done: %s", f"{n_series:,}"); maybe_print_progress(True)
-        n_events = crawl_events_full(yield_item, state); log.info("events(full) done: %s", f"{n_events:,}"); maybe_print_progress(True)
-        n_markets = crawl_markets_full(yield_item, state); log.info("markets(full) done: %s", f"{n_markets:,}"); maybe_print_progress(True)
-        wm.flush_all()
-        state["first_full_done"] = True; state["last_run_ts"] = int(NOW_UTC.timestamp()); save_state(state)
-        save_targets(targets)
-        atomic_write_json(ORCH_ROOT / "manifest.json", {
-            "base_url": BASE_URL,
-            "mode": "fanout_streaming_push_quiet",
-            "last_run_utc": NOW_UTC.isoformat(),
-            "commit_every_files": COMMIT_EVERY_FILES,
-            "max_open_repos": MAX_OPEN_REPOS,
-        })
-        log.info("DONE – fan-out crawl complete (streaming push, quiet)")
+        n_series = crawl_series_all(yield_item)
+        log.info("series done: %s", f"{n_series:,}")
+
+        n_events = crawl_events_full(yield_item, state)
+        log.info("events(full) done: %s", f"{n_events:,}")
+
+        n_markets = crawl_markets_full(yield_item, state)
+        log.info("markets(full) done: %s", f"{n_markets:,}")
+
+        state["first_full_done"] = True
+        save_state(state)
+
     finally:
-        wm.close_all()
+        # Ensure all writers flush/close and local repos are removed to protect runner disk
+        try:
+            wm.close_all()
+        except Exception:
+            log.exception("wm.close_all failed")
+
 
 if __name__ == "__main__":
+
     try:
         main()
     except Exception as e:
