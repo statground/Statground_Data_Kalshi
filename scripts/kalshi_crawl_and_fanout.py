@@ -356,7 +356,6 @@ def gh_create_repo(owner: str, repo: str, description: str = ""):
         raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
 
     raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
-    raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
 def ensure_repo(owner: str, repo: str, description: str = ""):
     k = (owner, repo)
     if k in _repo_ensured:
@@ -630,101 +629,92 @@ class RepoWriter:
         self.repo = repo
         self.local_path = local_path
         self.tracker = tracker
-
-        self._opened = False
-        self._closed = False
-
-        self.kind, self.scope = self._parse_kind_scope(repo)
-
-        # rollover counters (approx disk growth)
         self.files_written = 0
-        self.bytes_written = 0
         self.last_flush_files = 0
-
-    @staticmethod
-    def _parse_kind_scope(repo: str) -> tuple[str, str]:
-        # Handle Series repo (no rollover)
-        if repo.endswith("_Series") or "_Series" in repo:
-            return ("Series", "Series")
-        parts = repo.split("_")
-        if len(parts) >= 3 and parts[-1].isdigit():
-            return (parts[-3], parts[-2])
-        return ("Unknown", "unknown")
+        self._opened = False
+        # Only stage/commit files we write in this process. This avoids staging deletions
+        # when we clean up local files to keep runner disk usage low.
+        self._pending_paths: list[str] = []
 
     def open(self):
         if self._opened:
             return
-        self._opened = True
-        ensure_repo(self.owner, self.repo)
         ensure_local_repo(self.owner, self.repo, self.local_path)
+        self._opened = True
 
-    def write_json(self, relpath: str, obj: dict):
-        if not self._opened:
-            self.open()
-
-        path = os.path.join(self.local_path, relpath)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(payload)
-
+    def write_json(self, relpath: str, obj: dict, pretty: bool = False):
+        self.open()
+        p = Path(self.local_path) / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(obj, ensure_ascii=False, indent=(2 if pretty else None), sort_keys=False)
+        p.write_text(data + "\n", encoding="utf-8")
         self.files_written += 1
-        # approximate bytes written (payload only)
-        self.bytes_written += len(payload.encode("utf-8"))
+        self._pending_paths.append(relpath)
 
-    def _disk_guardrail_hit(self) -> bool:
-        free_gb = disk_free_gb(self.local_path)
-        return free_gb > 0 and free_gb < MIN_FREE_GB
-
-    def would_rollover(self) -> bool:
-        if self.kind == "Series":
-            return False
-        if self.files_written >= MAX_FILES_PER_REPO:
-            return True
-        if self.bytes_written >= MAX_BYTES_PER_REPO:
-            return True
-        return self._disk_guardrail_hit()
-
-    def maybe_flush(self, force: bool = False):
-        if self._closed:
+    def maybe_flush(self, force: bool):
+        # Flush when we have enough pending files or on force.
+        if not self._opened:
+            return
+        pending = len(self._pending_paths)
+        if not force and pending < COMMIT_EVERY_FILES:
             return
 
-        if not force:
-            if (self.files_written - self.last_flush_files) < COMMIT_EVERY_FILES:
-                # still check guardrail to avoid late OOD failures
-                if self.would_rollover():
-                    raise RolloverRequested()
-                return
+        # Always include counts file if present
+        counts_path = "KALSHI_COUNTS.json"
+        if (Path(self.local_path) / counts_path).exists():
+            self._pending_paths.append(counts_path)
+
+        # De-duplicate and chunk git add to avoid command length limits
+        unique_paths = []
+        seen = set()
+        for rp in self._pending_paths:
+            if rp not in seen:
+                seen.add(rp)
+                unique_paths.append(rp)
 
         changed = git_commit_push_if_changed(
             self.local_path,
             f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
+            paths=unique_paths,
         )
-        if changed:
-            self.last_flush_files = self.files_written
 
-        if self.would_rollover():
-            raise RolloverRequested()
+        # After push, aggressively delete data files from local worktree to keep runner disk usage low.
+        # We DO NOT stage these deletions (since we only 'git add' the paths above), so remote history is preserved.
+        if changed:
+            for rp in unique_paths:
+                if rp == counts_path:
+                    continue
+                fp = Path(self.local_path) / rp
+                try:
+                    if fp.exists() and fp.is_file():
+                        fp.unlink()
+                except Exception:
+                    pass
+            # Best-effort: remove empty directories
+            try:
+                for root, dirs, files in os.walk(self.local_path, topdown=False):
+                    if root.endswith(os.sep + ".git") or f"{os.sep}.git{os.sep}" in root:
+                        continue
+                    if not dirs and not files:
+                        try:
+                            os.rmdir(root)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        self.last_flush_files = self.files_written
+        self._pending_paths = []
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
         try:
-            git_commit_push_if_changed(
-                self.local_path,
-                f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
-            )
+            self.maybe_flush(True)
         finally:
             # Always remove local worktree to free runner disk
             try:
                 shutil.rmtree(self.local_path, ignore_errors=True)
             except Exception:
                 pass
-
-
-
 class WriterManager:
     """Manages a small number of open local git worktrees to stay within runner disk limits."""
 
@@ -897,3 +887,48 @@ def main():
             progress[kind0] += 1
         progress["total"] += 1
         maybe_print_progress(False)
+
+    first_run = not state.get("first_full_done")
+    log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
+
+    try:
+        n_series = crawl_series_all(yield_item); log.info("series done: %s", f"{n_series:,}"); maybe_print_progress(True)
+        n_events = crawl_events_full(yield_item, state); log.info("events(full) done: %s", f"{n_events:,}"); maybe_print_progress(True)
+        n_markets = crawl_markets_full(yield_item, state); log.info("markets(full) done: %s", f"{n_markets:,}"); maybe_print_progress(True)
+        wm.flush_all()
+        state["first_full_done"] = True; state["last_run_ts"] = int(NOW_UTC.timestamp()); save_state(state)
+        save_targets(targets)
+        atomic_write_json(ORCH_ROOT / "manifest.json", {
+            "base_url": BASE_URL,
+            "mode": "fanout_streaming_push_quiet",
+            "last_run_utc": NOW_UTC.isoformat(),
+            "commit_every_files": COMMIT_EVERY_FILES,
+            "max_open_repos": MAX_OPEN_REPOS,
+        })
+        log.info("DONE – fan-out crawl complete (streaming push, quiet)")
+    finally:
+        wm.close_all()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        if isinstance(e, subprocess.CalledProcessError):
+            print("\n========== FAILED COMMAND ==========")
+            try:
+                print("CMD:", " ".join(e.cmd) if isinstance(e.cmd, (list, tuple)) else str(e.cmd))
+            except Exception:
+                pass
+            if e.stderr:
+                print("\n--- stderr (tail) ---")
+                print((e.stderr or "")[-4000:])
+            if e.output:
+                print("\n--- stdout (tail) ---")
+                out = e.output if isinstance(e.output, str) else str(e.output)
+                print(out[-2000:])
+            print("===================================\n")
+        log.exception("FATAL: %s", e)
+        print("\n========== LOG TAIL (last lines) ==========")
+        print(tail_file(LOG_FILE, LOG_TAIL_ON_ERROR))
+        print("==========================================\n")
+        raise

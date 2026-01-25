@@ -123,7 +123,7 @@ def build_md(owner: str, prefix: str, rows: List[Tuple[str, Dict[str, int], str]
 
     md.append("")
     md.append("### Notes")
-    md.append("- Counts are computed by cloning each repo with `--depth 1` and running `git ls-tree`.")
+    md.append("- Counts are computed by cloning each repo with `--filter=blob:none --no-checkout --depth 1` and running `git ls-tree`.")
     md.append("- This workflow is intended to run less frequently than the crawl (e.g., daily).")
     return "\n".join(md) + "\n"
 
@@ -135,10 +135,12 @@ def main() -> int:
     repos = gh_list_repos_by_prefix(owner, prefix)
     # Prefer stable ordering: Current, unknown, then years
     def sort_key(r: str):
-        if r.endswith("_Current"):
+        if re.search(r"_Current(_\d{3})?$", r):
             return (0, r)
-        if r.endswith("_unknown"):
+        if re.search(r"_unknown(_\d{3})?$", r):
             return (1, r)
+        if r.endswith("_Series"):
+            return (0, r)
         m = re.search(r"_(\d{4})$", r)
         if m:
             return (2, int(m.group(1)))
