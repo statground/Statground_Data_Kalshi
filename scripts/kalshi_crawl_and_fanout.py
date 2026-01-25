@@ -257,7 +257,15 @@ _repo_ensured: set = set()
 
 def target_repo_for_relpath(rel: str, tracker: "RepoRolloverTracker", targets: dict) -> str:
     """Choose which GitHub repo should receive a file based on its relative path."""
-    rel = rel.lstrip("/")
+    # Some helpers may pass a pathlib.Path; normalize before string operations.
+    if isinstance(rel, Path):
+        rel = rel.as_posix()
+    else:
+        rel = str(rel)
+
+    # Normalize leading separators.
+    while rel.startswith("/"):
+        rel = rel[1:]
     if rel.startswith("series/"):
         return targets["series_repo"]
 
