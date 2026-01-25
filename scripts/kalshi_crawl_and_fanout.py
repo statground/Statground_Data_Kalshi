@@ -50,6 +50,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
+
+def dt_utc_now_str() -> str:
+    """UTC now as ISO-8601 string (seconds precision, Z suffix)."""
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
 # -----------------------------
 # Globals / Config
 # -----------------------------
