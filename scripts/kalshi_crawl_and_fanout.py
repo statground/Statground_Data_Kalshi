@@ -16,6 +16,7 @@ Env:
 """
 
 import os
+import shutil
 import hashlib, re, json, time, datetime, shutil, subprocess, logging
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -46,6 +47,14 @@ SLEEP_SEC = float(os.getenv("KALSHI_SLEEP_SEC", "0.02"))
 
 COMMIT_EVERY_FILES = int(os.getenv("KALSHI_COMMIT_EVERY_FILES", "5000"))
 MAX_OPEN_REPOS = int(os.getenv("KALSHI_MAX_OPEN_REPOS", "3"))
+
+# Rollover / disk safety
+# - We cap per-repo growth (approx by bytes written and file count) to avoid exhausting the runner disk and git index limits.
+# - "bytes written" is an approximation (JSON+meta payload sizes) but tracks disk growth closely enough for rollovers.
+MAX_BYTES_PER_REPO = int(os.getenv("KALSHI_MAX_BYTES_PER_REPO", str(3_000_000_000)))  # ~3GB
+MAX_FILES_PER_REPO = int(os.getenv("KALSHI_MAX_FILES_PER_REPO", str(250_000)))
+MIN_FREE_GB = float(os.getenv("KALSHI_MIN_FREE_GB", "2.0"))  # global free space guardrail
+
 GIT_PUSH_EVERY_SEC = int(os.getenv("KALSHI_GIT_PUSH_EVERY_SEC", "0"))
 
 PRINT_EVERY_ITEMS = int(os.getenv("KALSHI_PRINT_EVERY_ITEMS", "100000"))
@@ -226,13 +235,9 @@ def default_targets() -> dict:
     return {
         "owner": owner,
         "series_repo": "Statground_Data_Kalshi_Series",
-        # Split events and markets into separate repositories, and shard
-        # to avoid gigantic working trees and git index growth.
+        # Repositories are split by entity type (Events / Markets / Series) and by scope (Current / year),
+        # and additionally use a rollover index suffix (_001, _002, ...) to stay disk-safe.
         "repo_prefix": "Statground_Data_Kalshi",
-        # Keep shard counts small to avoid opening too many repos in one run.
-        # (Markets are huge; events are relatively smaller.)
-        "shards": {"events": int(os.getenv("KALSHI_EVENT_SHARDS", "2")),
-                   "markets": int(os.getenv("KALSHI_MARKET_SHARDS", "4"))},
     }
 
 def load_targets() -> dict:
@@ -247,6 +252,39 @@ def save_targets(targets: dict):
 _owner_type_cache: Dict[str, str] = {}
 _repo_exists_cache: Dict[Tuple[str, str], bool] = {}
 _repo_ensured: set = set()
+
+
+class RepoRolloverTracker:
+    """Tracks which {NNN} repo suffix is active per (kind, scope). Persisted in state.
+
+    kind: 'Events' | 'Markets'
+    scope: 'Current' | 'YYYY' | 'unknown'
+    """
+    def __init__(self, targets: dict, state: dict):
+        self.targets = targets
+        self.state = state
+        self.prefix = targets.get("repo_prefix", "Statground_Data_Kalshi")
+        # state["rollover"] stores current indices
+        self.state.setdefault("rollover", {})  # e.g. {"Events:Current": 1, "Markets:2026": 2}
+
+    def _key(self, kind: str, scope: str) -> str:
+        return f"{kind}:{scope}"
+
+    def index(self, kind: str, scope: str) -> int:
+        return int(self.state["rollover"].get(self._key(kind, scope), 1))
+
+    def bump(self, kind: str, scope: str) -> int:
+        k = self._key(kind, scope)
+        i = int(self.state["rollover"].get(k, 1)) + 1
+        self.state["rollover"][k] = i
+        return i
+
+    def repo(self, kind: str, scope: str) -> str:
+        # series is a singleton
+        if kind == "Series" or scope == "Series":
+            return self.targets.get("series_repo", f"{self.prefix}_Series")
+        i = self.index(kind, scope)
+        return f"{self.prefix}_{kind}_{scope}_{i:03d}"
 
 def gh_owner_type(owner: str) -> str:
     if owner in _owner_type_cache:
@@ -270,20 +308,54 @@ def gh_repo_exists(owner: str, repo: str) -> bool:
         _repo_exists_cache[k] = False
         return False
     raise RuntimeError(f"GitHub: repo check failed {owner}/{repo}: {r.status_code} {r.text[:300]}")
-def gh_create_repo(owner: str, repo: str, description: str):
-    otype = gh_owner_type(owner)
-    payload = {"name": repo, "description": description, "private": bool(DEFAULT_VISIBILITY_PRIVATE),
-               "auto_init": True, "has_issues": False, "has_projects": False, "has_wiki": False}
-    url = f"{GITHUB_API}/orgs/{owner}/repos" if otype == "Organization" else f"{GITHUB_API}/user/repos"
-    r = gh_post(url, payload)
-    if r.status_code == 201:
-        log.info("Created repo: %s/%s", owner, repo)
-        _repo_exists_cache[(owner, repo)] = True
+def gh_create_repo(owner: str, repo: str, description: str = ""):
+    """Create a GitHub repo if needed.
+
+    GitHub's create-repo endpoint can return 422 for several reasons, including
+    'name already exists' or transient validation/race conditions. We treat any
+    422 as 'maybe already exists' and re-check existence before failing.
+    """
+    url = "https://api.github.com/user/repos"
+    payload = {"name": repo, "private": False, "description": description}
+
+    def _post():
+        return gh_post(url, payload)
+
+    r = _post()
+    if r.status_code in (201, 202):
         return
-    if r.status_code == 422 and "already exists" in (r.text or "").lower():
-        log.info("Repo already exists (race): %s/%s", owner, repo)
-        _repo_exists_cache[(owner, repo)] = True
-        return
+
+    if r.status_code == 422:
+        # Race / eventual consistency / name already exists.
+        for delay_s in (0, 1, 2, 4):
+            if delay_s:
+                time.sleep(delay_s)
+            try:
+                if gh_repo_exists(owner, repo):
+                    log.info("Repo already exists (create returned 422): %s/%s", owner, repo)
+                    _repo_exists_cache[(owner, repo)] = True
+                    return
+            except Exception:
+                pass
+
+        # One more retry of creation, then re-check.
+        for delay_s in (2, 4):
+            time.sleep(delay_s)
+            r2 = _post()
+            if r2.status_code in (201, 202):
+                return
+            try:
+                if gh_repo_exists(owner, repo):
+                    log.info("Repo exists after retry (create returned 422): %s/%s", owner, repo)
+                    _repo_exists_cache[(owner, repo)] = True
+                    return
+            except Exception:
+                pass
+
+        # Fall through: genuine validation failure.
+        raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
+
+    raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
     raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
 def ensure_repo(owner: str, repo: str, description: str = ""):
     k = (owner, repo)
@@ -442,69 +514,13 @@ def _shard2(s: str) -> str:
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return h[:2]
 
-def _bucket_from_shard(shard: str, buckets: int) -> str:
-    """Deterministically map a shard folder (e.g., 'a3') to a 001..NNN bucket."""
-    if not shard:
-        return "001"
+def disk_free_gb(path: str) -> float:
+    """Return free disk space in GB for the filesystem containing `path`."""
     try:
-        n = int(shard[0], 16)
+        du = shutil.disk_usage(path)
+        return du.free / (1024**3)
     except Exception:
-        n = 0
-    idx = (n % max(1, int(buckets))) + 1
-    return f"{idx:03d}"
-
-
-def _repo_name(prefix: str, kind: str, scope: str, bucket: str) -> str:
-    # kind: 'Events' | 'Markets'
-    # scope: 'Current' | '2026' | 'unknown'
-    return f"{prefix}_{kind}_{scope}_{bucket}"
-
-
-def target_repo_for_relpath(rel: Path, targets: dict) -> str:
-    """Route each JSON file to a *sharded* target repository.
-
-    Why:
-      - A single repo with >1M files makes `git add -A` / index updates blow up in
-        GitHub Actions (disk space, time).
-
-    Policy:
-      - series/*                        -> one small repo (targets['series_repo'])
-      - events/* and markets/*          -> split by entity AND shard into buckets
-          * open/*                      -> <prefix>_<Kind>_Current_###
-          * closed/<YYYY>/*             -> <prefix>_<Kind>_<YYYY>_###
-    """
-    parts = rel.parts
-    prefix = targets.get("repo_prefix", "Statground_Data_Kalshi")
-    buckets = targets.get("buckets", {"events": 2, "markets": 4})
-
-    if not parts:
-        return _repo_name(prefix, "Markets", "Current", "001")
-
-    if parts[0] == "series":
-        return targets.get("series_repo", "Statground_Data_Kalshi_Series")
-
-    if parts[0] not in ("events", "markets"):
-        return _repo_name(prefix, "Markets", "Current", "001")
-
-    kind = "Events" if parts[0] == "events" else "Markets"
-    bucket_count = int(buckets.get(parts[0], 2))
-
-    # rel scheme: <entity>/<open|closed>/<YYYY>/<MM>/<shard>/<file>.json
-    status = parts[1] if len(parts) >= 2 else "open"
-    year = None
-    shard = None
-
-    if len(parts) >= 3:
-        year = parts[2]
-    if len(parts) >= 5:
-        shard = parts[4]
-
-    bucket = _bucket_from_shard(shard or "", bucket_count)
-    if status == "closed" and year and str(year).isdigit():
-        return _repo_name(prefix, kind, str(year), bucket)
-    # open (or unknown) -> Current
-    return _repo_name(prefix, kind, "Current", bucket)
-
+        return 0.0
 def run(cmd, cwd=None, check=True, echo_to_console=False):
     """Run a command.
     - Always log command line to logfile
@@ -602,76 +618,170 @@ def git_commit_push_if_changed(repo_path: Path, msg: str, paths: list[str] | Non
 
     return True
 
+
+class RolloverRequested(Exception):
+    """Internal signal: current writer hit rollover threshold."""
+    pass
+
+
 class RepoWriter:
-    def __init__(self, owner: str, repo: str, local_path: Path):
+    def __init__(self, owner: str, repo: str, local_path: str, tracker: RepoRolloverTracker):
         self.owner = owner
         self.repo = repo
         self.local_path = local_path
-        self.files_since_commit = 0
-        self._dirty_paths: list[str] = []
-        self.last_push_ts = time.time()
+        self.tracker = tracker
+
+        self._opened = False
+        self._closed = False
+
+        self.kind, self.scope = self._parse_kind_scope(repo)
+
+        # rollover counters (approx disk growth)
+        self.files_written = 0
+        self.bytes_written = 0
+        self.last_flush_files = 0
+
+    @staticmethod
+    def _parse_kind_scope(repo: str) -> tuple[str, str]:
+        # Handle Series repo (no rollover)
+        if repo.endswith("_Series") or "_Series" in repo:
+            return ("Series", "Series")
+        parts = repo.split("_")
+        if len(parts) >= 3 and parts[-1].isdigit():
+            return (parts[-3], parts[-2])
+        return ("Unknown", "unknown")
+
     def open(self):
-        rm_rf(self.local_path)
-        self.local_path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("Opening repo worktree: %s", self.repo)
-        run(["git", "clone", "--depth", "1", repo_remote_url(self.owner, self.repo), str(self.local_path)])
-        git_config_identity(self.local_path)
-    def write(self, rel: Path, obj: dict):
-        atomic_write_json(self.local_path / rel, obj)
-        self.files_since_commit += 1
-        # Track changed file paths so we can "git add" only what we touched,
-        # avoiding an expensive tree-wide scan (git add -A) on huge repos.
-        self._dirty_paths.append(str(rel))
-    def maybe_flush(self, force=False):
-        do_by_files = self.files_since_commit >= COMMIT_EVERY_FILES
-        do_by_time = (GIT_PUSH_EVERY_SEC > 0) and ((time.time() - self.last_push_ts) >= GIT_PUSH_EVERY_SEC)
-        if force or do_by_files or do_by_time:
-            dirty = self._dirty_paths
-            self._dirty_paths = []
-            changed = git_commit_push_if_changed(
+        if self._opened:
+            return
+        self._opened = True
+        ensure_repo(self.owner, self.repo)
+        ensure_local_repo(self.owner, self.repo, self.local_path)
+
+    def write_json(self, relpath: str, obj: dict):
+        if not self._opened:
+            self.open()
+
+        path = os.path.join(self.local_path, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+
+        self.files_written += 1
+        # approximate bytes written (payload only)
+        self.bytes_written += len(payload.encode("utf-8"))
+
+    def _disk_guardrail_hit(self) -> bool:
+        free_gb = disk_free_gb(self.local_path)
+        return free_gb > 0 and free_gb < MIN_FREE_GB
+
+    def would_rollover(self) -> bool:
+        if self.kind == "Series":
+            return False
+        if self.files_written >= MAX_FILES_PER_REPO:
+            return True
+        if self.bytes_written >= MAX_BYTES_PER_REPO:
+            return True
+        return self._disk_guardrail_hit()
+
+    def maybe_flush(self, force: bool = False):
+        if self._closed:
+            return
+
+        if not force:
+            if (self.files_written - self.last_flush_files) < COMMIT_EVERY_FILES:
+                # still check guardrail to avoid late OOD failures
+                if self.would_rollover():
+                    raise RolloverRequested()
+                return
+
+        changed = git_commit_push_if_changed(
+            self.local_path,
+            f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
+        )
+        if changed:
+            self.last_flush_files = self.files_written
+
+        if self.would_rollover():
+            raise RolloverRequested()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            git_commit_push_if_changed(
                 self.local_path,
                 f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
-                paths=dirty,
             )
-            if changed:
-                self.last_push_ts = time.time()
-            self.files_since_commit = 0
-    def close(self):
-        self.maybe_flush(force=True)
-        rm_rf(self.local_path)
+        finally:
+            # Always remove local worktree to free runner disk
+            try:
+                shutil.rmtree(self.local_path, ignore_errors=True)
+            except Exception:
+                pass
+
+
 
 class WriterManager:
-    def __init__(self, owner: str):
+    """Manages a small number of open local git worktrees to stay within runner disk limits."""
+
+    def __init__(self, owner: str, tracker: RepoRolloverTracker, max_open_repos: int = MAX_OPEN_REPOS):
         self.owner = owner
-        self.writers = OrderedDict()
-        self._ensured = set()
+        self.tracker = tracker
+        self.max_open_repos = max_open_repos
+        self.writers: dict[str, RepoWriter] = {}
+        self.open_order: list[str] = []  # LRU-ish
+
     def get(self, repo: str) -> RepoWriter:
         if repo in self.writers:
-            self.writers.move_to_end(repo)
+            # touch for LRU
+            if repo in self.open_order:
+                self.open_order.remove(repo)
+            self.open_order.append(repo)
             return self.writers[repo]
 
-        # Lazily create repos as we discover new shards/years.
-        if repo not in self._ensured:
-            desc = f"Kalshi data mirror (fan-out) | {repo}"
-            ensure_repo(self.owner, repo, desc)
-            self._ensured.add(repo)
-        while len(self.writers) >= MAX_OPEN_REPOS:
-            old_repo, old_writer = self.writers.popitem(last=False)
-            log.info("Closing LRU repo worktree: %s", old_repo)
-            old_writer.close()
-        w = RepoWriter(self.owner, repo, REPOS_DIR / repo)
+        # Evict if needed
+        while len(self.open_order) >= self.max_open_repos:
+            evict_repo = self.open_order.pop(0)
+            w = self.writers.pop(evict_repo, None)
+            if w:
+                log.info("Closing repo: %s", evict_repo)
+                w.close()
+
+        local_path = os.path.join(WORK_REPOS_DIR, repo)
+        w = RepoWriter(self.owner, repo, local_path, self.tracker)
         w.open()
         self.writers[repo] = w
+        self.open_order.append(repo)
         return w
+
+    
     def flush_all(self):
-        for repo, w in list(self.writers.items()):
-            log.info("Flushing repo: %s", repo)
-            w.maybe_flush(force=True)
-    def close_all(self):
-        for repo, w in list(self.writers.items()):
-            log.info("Closing repo: %s", repo)
-            w.close()
+        for repo in list(self.open_order):
+            w = self.writers.get(repo)
+            if w:
+                try:
+                    w.maybe_flush(force=True)
+                except RolloverRequested:
+                    # If flush triggers rollover, just close; next write will open new repo.
+                    w.close()
+                    self.writers.pop(repo, None)
+                    if repo in self.open_order:
+                        self.open_order.remove(repo)
+
+def close_all(self):
+        for repo in list(self.open_order):
+            w = self.writers.get(repo)
+            if w:
+                log.info("Closing repo: %s", repo)
+                w.close()
         self.writers.clear()
+        self.open_order.clear()
+
+
 
 def crawl_series_all(yield_item) -> int:
     data = kalshi_get_json("/series", params={})
@@ -736,10 +846,8 @@ def main():
 
     owner = targets.get("owner") or os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
     targets["owner"] = owner
-    targets.setdefault("series_repo", "Statground_Data_Kalshi_Series")
-    targets.setdefault("prefix", "Statground_Data_Kalshi")
-    targets.setdefault("buckets", {"events": int(os.getenv("KALSHI_BUCKETS_EVENTS", "2")),
-                                   "markets": int(os.getenv("KALSHI_BUCKETS_MARKETS", "4"))})
+    targets.setdefault("repo_prefix", "Statground_Data_Kalshi")
+    targets.setdefault("series_repo", f"{targets['repo_prefix']}_Series")
 
     log.info("Kalshi fan-out crawler | owner=%s", owner)
     log.info("base_url=%s", BASE_URL)
@@ -748,7 +856,8 @@ def main():
 
     ensure_repo(owner, targets["series_repo"], "Kalshi series snapshot (auto-created)")
 
-    wm = WriterManager(owner)
+    tracker = RepoRolloverTracker(targets, state)
+    wm = WriterManager(owner, tracker)
     progress = {"series": 0, "events": 0, "markets": 0, "total": 0, "last_print": 0}
 
     def maybe_print_progress(force=False):
@@ -758,56 +867,33 @@ def main():
             progress["last_print"] = progress["total"]
 
     def yield_item(rel: Path, obj: dict):
-        repo = target_repo_for_relpath(rel, targets)
-        w = wm.get(repo)
-        w.write(rel, obj)
-        w.maybe_flush(False)
-        kind = rel.parts[0]
-        if kind in progress: progress[kind] += 1
+        nonlocal tracker
+        repo = target_repo_for_relpath(rel, tracker)
+
+        while True:
+            w = wm.get(repo)
+            try:
+                w.write_json(str(rel), obj)
+                w.maybe_flush(False)
+                break
+            except RolloverRequested:
+                # Close and advance to next repo index for this (kind, scope)
+                kind, scope = w.kind, w.scope
+                log.warning("[rollover] triggered for %s (kind=%s scope=%s). Switching repo index.", repo, kind, scope)
+                w.close()
+                # remove writer from manager
+                wm.writers.pop(repo, None)
+                if repo in wm.open_order:
+                    wm.open_order.remove(repo)
+                if kind != "Series":
+                    tracker.bump(kind, scope)
+                    repo = tracker.repo(kind, scope)
+                else:
+                    # should never happen, but avoid infinite loops
+                    raise
+
+        kind0 = rel.parts[0]
+        if kind0 in progress:
+            progress[kind0] += 1
         progress["total"] += 1
         maybe_print_progress(False)
-
-    first_run = not state.get("first_full_done")
-    log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
-
-    try:
-        n_series = crawl_series_all(yield_item); log.info("series done: %s", f"{n_series:,}"); maybe_print_progress(True)
-        n_events = crawl_events_full(yield_item, state); log.info("events(full) done: %s", f"{n_events:,}"); maybe_print_progress(True)
-        n_markets = crawl_markets_full(yield_item, state); log.info("markets(full) done: %s", f"{n_markets:,}"); maybe_print_progress(True)
-        wm.flush_all()
-        state["first_full_done"] = True; state["last_run_ts"] = int(NOW_UTC.timestamp()); save_state(state)
-        save_targets(targets)
-        atomic_write_json(ORCH_ROOT / "manifest.json", {
-            "base_url": BASE_URL,
-            "mode": "fanout_streaming_push_quiet",
-            "last_run_utc": NOW_UTC.isoformat(),
-            "commit_every_files": COMMIT_EVERY_FILES,
-            "max_open_repos": MAX_OPEN_REPOS,
-        })
-        log.info("DONE – fan-out crawl complete (streaming push, quiet)")
-    finally:
-        wm.close_all()
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        if isinstance(e, subprocess.CalledProcessError):
-            print("\n========== FAILED COMMAND ==========")
-            try:
-                print("CMD:", " ".join(e.cmd) if isinstance(e.cmd, (list, tuple)) else str(e.cmd))
-            except Exception:
-                pass
-            if e.stderr:
-                print("\n--- stderr (tail) ---")
-                print((e.stderr or "")[-4000:])
-            if e.output:
-                print("\n--- stdout (tail) ---")
-                out = e.output if isinstance(e.output, str) else str(e.output)
-                print(out[-2000:])
-            print("===================================\n")
-        log.exception("FATAL: %s", e)
-        print("\n========== LOG TAIL (last lines) ==========")
-        print(tail_file(LOG_FILE, LOG_TAIL_ON_ERROR))
-        print("==========================================\n")
-        raise
