@@ -88,6 +88,15 @@ def setup_logging():
 
 log = setup_logging()
 
+
+def get_logger() -> logging.Logger:
+    """Return the module logger.
+
+    Earlier iterations of this script referenced get_logger() from main().
+    Keep this helper for backwards-compatibility.
+    """
+    return log
+
 def tail_file(path: Path, n: int) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -346,9 +355,15 @@ def gh_owner_type(owner: str) -> str:
     _owner_type_cache[owner] = t
     return t
 
-def gh_repo_exists(owner: str, repo: str) -> bool:
+def gh_repo_exists(owner: str, repo: str, refresh: bool = False) -> bool:
+    """Return True if the GitHub repo exists.
+
+    Note: during long-running crawls we can hit eventual-consistency / race
+    conditions where a repo is created and becomes visible a bit later.
+    When `refresh=True`, we bypass the local cache and re-check GitHub.
+    """
     k = (owner, repo)
-    if k in _repo_exists_cache:
+    if (not refresh) and (k in _repo_exists_cache):
         return _repo_exists_cache[k]
     r = gh_get(f"{GITHUB_API}/repos/{owner}/{repo}")
     if r.status_code == 200:
@@ -357,7 +372,12 @@ def gh_repo_exists(owner: str, repo: str) -> bool:
     if r.status_code == 404:
         _repo_exists_cache[k] = False
         return False
-    raise RuntimeError(f"GitHub: repo check failed {owner}/{repo}: {r.status_code} {r.text[:300]}")
+
+    # Any other response is unexpected (rate-limit, auth, GitHub outage, etc.).
+    raise RuntimeError(
+        f"GitHub: repo check failed {owner}/{repo}: {r.status_code} {r.text[:300]}"
+    )
+
 def gh_create_repo(owner: str, repo: str, description: str = ""):
     """Create a GitHub repo if needed.
 
@@ -381,7 +401,9 @@ def gh_create_repo(owner: str, repo: str, description: str = ""):
             if delay_s:
                 time.sleep(delay_s)
             try:
-                if gh_repo_exists(owner, repo):
+                # refresh=True to bypass negative cache in long-running jobs
+                # (the repo might have been created moments ago by another run).
+                if gh_repo_exists(owner, repo, refresh=True):
                     log.info("Repo already exists (create returned 422): %s/%s", owner, repo)
                     _repo_exists_cache[(owner, repo)] = True
                     return
@@ -395,7 +417,7 @@ def gh_create_repo(owner: str, repo: str, description: str = ""):
             if r2.status_code in (201, 202):
                 return
             try:
-                if gh_repo_exists(owner, repo):
+                if gh_repo_exists(owner, repo, refresh=True):
                     log.info("Repo exists after retry (create returned 422): %s/%s", owner, repo)
                     _repo_exists_cache[(owner, repo)] = True
                     return
