@@ -254,6 +254,31 @@ _repo_exists_cache: Dict[Tuple[str, str], bool] = {}
 _repo_ensured: set = set()
 
 
+
+def target_repo_for_relpath(rel: str, tracker: "RepoRolloverTracker", targets: dict) -> str:
+    """Choose which GitHub repo should receive a file based on its relative path."""
+    rel = rel.lstrip("/")
+    if rel.startswith("series/"):
+        return targets["series_repo"]
+
+    parts = rel.split("/")
+    if not parts:
+        return targets["series_repo"]
+
+    # events/{open|closed}/{YYYY|unknown}/...
+    if parts[0] == "events":
+        scope = parts[2] if len(parts) >= 3 and re.fullmatch(r"\d{4}", parts[2] or "") else "Current"
+        return tracker.repo("Events", scope)
+
+    # markets/{open|closed}/{YYYY|unknown}/...
+    if parts[0] == "markets":
+        scope = parts[2] if len(parts) >= 3 and re.fullmatch(r"\d{4}", parts[2] or "") else "Current"
+        return tracker.repo("Markets", scope)
+
+    # Fallback: treat as Events_Current (keeps unknowns together)
+    return tracker.repo("Events", "Current")
+
+
 class RepoRolloverTracker:
     """Tracks which {NNN} repo suffix is active per (kind, scope). Persisted in state.
 
@@ -762,7 +787,7 @@ class WriterManager:
                     if repo in self.open_order:
                         self.open_order.remove(repo)
 
-def close_all(self):
+    def close_all(self):
         for repo in list(self.open_order):
             w = self.writers.get(repo)
             if w:
@@ -858,7 +883,7 @@ def main():
 
     def yield_item(rel: Path, obj: dict):
         nonlocal tracker
-        repo = target_repo_for_relpath(rel, tracker)
+        repo = target_repo_for_relpath(rel, tracker, targets)
 
         while True:
             w = wm.get(repo)
