@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Every 6 hours (UTC). Adjust as needed.
-    - cron: "0 */6 * * *"
+    - cron: "0 */8 * * *"
 
 concurrency:
   group: kalshi-crawl-fanout
@@ -40,6 +40,9 @@ jobs:
           KALSHI_LOG_EVERY: "50"
           KALSHI_EVENT_BACKFILL_SEC: "172800"
           KALSHI_MARKET_BACKFILL_SEC: "120"
+          TIME_BUDGET_SECONDS: "19800"   # 5.5h safety budget under 6h GH limit
+          KALSHI_LIMIT_EVENTS: "200"
+          KALSHI_LIMIT_MARKETS: "1000"
           GIT_AUTHOR_NAME: "github-actions[bot]"
           GIT_AUTHOR_EMAIL: "github-actions[bot]@users.noreply.github.com"
         run: |

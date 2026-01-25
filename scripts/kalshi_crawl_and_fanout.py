@@ -587,24 +587,50 @@ def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     r.raise_for_status()
     return r.json()
 
-def paginate(path: str, list_key: str, params: Optional[Dict[str, Any]] = None, cursor_key: str = "cursor") -> Iterable[Dict[str, Any]]:
+def paginate_pages(
+    path: str,
+    list_key: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    cursor_key: str = "cursor",
+    start_cursor: Optional[str] = None,
+) -> Iterable[Tuple[List[Dict[str, Any]], Optional[str]]]:
     """
-    Generic cursor pagination.
+    Page-wise cursor pagination.
+
+    Yields (items, next_cursor). next_cursor is None when there are no more pages.
+
     Kalshi trade-api/v2 typically returns:
-      { <list_key>: [...], cursor: \"...\" }  OR { <list_key>: [...], next_cursor: \"...\" }
+      { <list_key>: [...], cursor: "..." }
+    Some older responses may use next_cursor, so we support both.
+
+    Docs: /markets limit up to 1000, /events limit up to 200.
     """
-    cursor = None
+    cursor = start_cursor
     p = dict(params or {})
     while True:
         if cursor:
             p[cursor_key] = cursor
         data = api_get(path, p)
         items = data.get(list_key, []) or []
+        next_cursor = data.get("cursor") or data.get("next_cursor") or None
+        yield (items, next_cursor)
+        if not next_cursor:
+            break
+        cursor = next_cursor
+
+def paginate(
+    path: str,
+    list_key: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    cursor_key: str = "cursor",
+    start_cursor: Optional[str] = None,
+) -> Iterable[Dict[str, Any]]:
+    """Item-wise wrapper over paginate_pages()."""
+    for items, _next in paginate_pages(path, list_key, params, cursor_key=cursor_key, start_cursor=start_cursor):
         for it in items:
             yield it
-        cursor = data.get("cursor") or data.get("next_cursor")
-        if not cursor:
-            break
 
 def shard_prefix(s: str) -> str:
     # shard by first two hex chars of sha1 for directory fanout
@@ -707,13 +733,28 @@ def pick_repo_for(rel: str, kind: str, tracker: RepoRolloverTracker, wm: WriterM
 def main() -> None:
     state = load_state()
     state.setdefault("cursors", {})
+    state.setdefault("progress", {})
     tracker = RepoRolloverTracker(state)
     wm = WriterManager(OWNER, COMMIT_EVERY_FILES, MAX_OPEN_REPOS)
     repos_seen: set[str] = set()
 
+    # Time budget: exit gracefully before GH Actions hard limit (often 6h).
+    # Default: 5h30m so we can flush/push state safely.
+    time_budget_s = int(os.environ.get("TIME_BUDGET_SECONDS", str(5 * 3600 + 30 * 60)))
+    started_mon = time.monotonic()
+    deadline_mon = started_mon + max(60, time_budget_s)
+
+    def time_left_s() -> int:
+        return int(deadline_mon - time.monotonic())
+
+    def should_stop() -> bool:
+        # Keep a small buffer for final flush/push.
+        return time_left_s() <= 10 * 60
+
     log.info("Kalshi fan-out crawler | owner=%s", OWNER)
     log.info("base_url=%s", BASE_URL)
     log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
+    log.info("time_budget_seconds=%s", time_budget_s)
     log.info("logfile=%s", str(LOG_FILE))
 
     mode = "FULL(first run)" if not state.get("completed_full") else "INCR"
@@ -721,57 +762,102 @@ def main() -> None:
 
     n_series = n_events = n_markets = 0
 
+    # Use max supported page sizes (reduces API calls).
+    # /events limit max 200
+    # /markets limit max 1000
+    limit_events = int(os.environ.get("KALSHI_LIMIT_EVENTS", "200"))
+    limit_markets = int(os.environ.get("KALSHI_LIMIT_MARKETS", "1000"))
+    limit_series = int(os.environ.get("KALSHI_LIMIT_SERIES", "1000"))
+
+    def graceful_stop(reason: str) -> None:
+        log.warning("Stopping early (%s). Flushing and saving state for next run... (time_left=%ss)", reason, time_left_s())
+        wm.flush_all()
+        save_state(state)
+        # Commit/push state in orchestrator (control repo)
+        git_commit_push_if_changed(Path("."), f"kalshi: save state ({reason})", CONTROL_OWNER, CONTROL_REPO)
+        wm.close_all()
+        raise SystemExit(0)
+
     try:
         # ---- SERIES ----
-        for o in paginate("/series", "series"):
-            rel = series_relpath(o)
-            repo = pick_repo_for(rel, "series", tracker, wm)
-            repos_seen.add(repo)
-            w = wm.get(repo, "Statground Kalshi series data")
-            w.write_json(rel, o, "series")
-            w.maybe_flush(False)
-            n_series += 1
-            if n_series % 5000 == 0:
-                log.info("series progress: %s", f"{n_series:,}")
-                save_state(state)
+        # Note: /series may not paginate (API docs do not list cursor params), but our
+        # page-wise paginator safely handles both.
+        series_cursor = state["cursors"].get("series_cursor")
+        for items, next_cursor in paginate_pages("/series", "series", {"limit": limit_series}, start_cursor=series_cursor):
+            for o in items:
+                rel = series_relpath(o)
+                repo = pick_repo_for(rel, "series", tracker, wm)
+                repos_seen.add(repo)
+                w = wm.get(repo, "Statground Kalshi series data")
+                w.write_json(rel, o, "series")
+                w.maybe_flush(False)
+                n_series += 1
+            state["cursors"]["series_cursor"] = next_cursor
+            state["progress"]["series"] = {"count": n_series, "updated_utc": dt_utc_now_str()}
+            save_state(state)
+            if n_series and n_series % 5000 == 0:
+                log.info("series progress: %s (time_left=%ss)", f"{n_series:,}", time_left_s())
+            if should_stop():
+                graceful_stop("time_budget")
 
+        # finished series
+        state["cursors"].pop("series_cursor", None)
+        save_state(state)
         log.info("series done: %s", f"{n_series:,}")
 
         # ---- EVENTS ----
-        for o in paginate("/events", "events"):
-            rel = event_relpath(o)
-            repo = pick_repo_for(rel, "event", tracker, wm)
-            repos_seen.add(repo)
-            w = wm.get(repo, "Statground Kalshi events data")
-            w.write_json(rel, o, "event")
-            w.maybe_flush(False)
-            n_events += 1
-            if n_events % 50000 == 0:
-                log.info("events progress: %s", f"{n_events:,}")
-                save_state(state)
+        events_cursor = state["cursors"].get("events_cursor")
+        for items, next_cursor in paginate_pages("/events", "events", {"limit": limit_events}, start_cursor=events_cursor):
+            for o in items:
+                rel = event_relpath(o)
+                repo = pick_repo_for(rel, "event", tracker, wm)
+                repos_seen.add(repo)
+                w = wm.get(repo, "Statground Kalshi events data")
+                w.write_json(rel, o, "event")
+                w.maybe_flush(False)
+                n_events += 1
 
+            state["cursors"]["events_cursor"] = next_cursor
+            state["progress"]["events"] = {"count": n_events, "updated_utc": dt_utc_now_str()}
+            save_state(state)
+            if n_events and n_events % 50000 == 0:
+                log.info("events progress: %s (time_left=%ss)", f"{n_events:,}", time_left_s())
+
+            if should_stop():
+                graceful_stop("time_budget")
+
+        state["cursors"].pop("events_cursor", None)
+        save_state(state)
         log.info("events done: %s", f"{n_events:,}")
 
         # ---- MARKETS ----
-        for o in paginate("/markets", "markets"):
-            rel = market_relpath(o)
-            repo = pick_repo_for(rel, "market", tracker, wm)
-            repos_seen.add(repo)
-            w = wm.get(repo, "Statground Kalshi markets data")
-            w.write_json(rel, o, "market")
-            w.maybe_flush(False)
-            n_markets += 1
-            if n_markets % 50000 == 0:
-                log.info("markets progress: %s", f"{n_markets:,}")
-                save_state(state)
+        markets_cursor = state["cursors"].get("markets_cursor")
 
-        log.info("markets done: %s", f"{n_markets:,}")
+        for items, next_cursor in paginate_pages("/markets", "markets", {"limit": limit_markets}, start_cursor=markets_cursor):
+            for o in items:
+                rel = market_relpath(o)
+                repo = pick_repo_for(rel, "market", tracker, wm)
+                repos_seen.add(repo)
+                w = wm.get(repo, "Statground Kalshi markets data")
+                w.write_json(rel, o, "market")
+                w.maybe_flush(False)
+                n_markets += 1
+
+            state["cursors"]["markets_cursor"] = next_cursor
+            state["progress"]["markets"] = {"count": n_markets, "updated_utc": dt_utc_now_str()}
+            save_state(state)
+            if n_markets and n_markets % 50000 == 0:
+                log.info("markets progress: %s (time_left=%ss)", f"{n_markets:,}", time_left_s())
+
+            if should_stop():
+                graceful_stop("time_budget")
+
+        state["cursors"].pop("markets_cursor", None)
 
         # final flush
         wm.flush_all()
 
         # Write a manifest of repositories we touched this run.
-        # This is used by the stats generator to avoid GitHub REST API listing.
         manifest = {
             "updated_utc": dt_utc_now_str(),
             "owner": OWNER,
@@ -785,6 +871,8 @@ def main() -> None:
         # Commit/push manifest + state updates in this control repo (Statground_Data_Kalshi)
         git_commit_push_if_changed(Path("."), "kalshi: update manifest/state", CONTROL_OWNER, CONTROL_REPO)
 
+    except SystemExit:
+        raise
     except Exception as e:
         log.error("FATAL: %s", e, exc_info=True)
         # attempt to flush what we can
