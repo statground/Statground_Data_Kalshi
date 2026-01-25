@@ -230,6 +230,16 @@ def gh_headers() -> Dict[str, str]:
 
 def gh_repo_exists(owner: str, repo: str) -> bool:
     r = requests.get(f"{GH_API}/repos/{owner}/{repo}", headers=gh_headers(), timeout=30)
+    if r.status_code == 403 and "rate limit" in (r.text or "").lower():
+        reset = r.headers.get("X-RateLimit-Reset")
+        reset_dt = ""
+        if reset and str(reset).isdigit():
+            try:
+                reset_dt = datetime.fromtimestamp(int(reset), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except Exception:
+                reset_dt = ""
+        extra = f" (reset: {reset_dt})" if reset_dt else ""
+        raise RuntimeError(f"GitHub API rate limit exceeded while checking repo existence{extra}.")
     return r.status_code == 200
 
 def gh_create_repo(owner: str, repo: str, description: str = "") -> None:
@@ -239,6 +249,16 @@ def gh_create_repo(owner: str, repo: str, description: str = "") -> None:
     """
     payload = {"name": repo, "description": description, "private": False, "has_issues": False, "has_projects": False, "has_wiki": False}
     r = requests.post(f"{GH_API}/user/repos", headers=gh_headers(), json=payload, timeout=60)
+    if r.status_code == 403 and "rate limit" in (r.text or "").lower():
+        reset = r.headers.get("X-RateLimit-Reset")
+        reset_dt = ""
+        if reset and str(reset).isdigit():
+            try:
+                reset_dt = datetime.fromtimestamp(int(reset), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except Exception:
+                reset_dt = ""
+        extra = f" (reset: {reset_dt})" if reset_dt else ""
+        raise RuntimeError(f"GitHub API rate limit exceeded while creating repo {owner}/{repo}{extra}.")
     if r.status_code in (201,):
         log.info("Created repo: %s/%s", owner, repo)
         return
@@ -249,8 +269,26 @@ def gh_create_repo(owner: str, repo: str, description: str = "") -> None:
     raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
 
 def ensure_repo(owner: str, repo: str, description: str = "") -> None:
-    if gh_repo_exists(owner, repo):
+    # Avoid GitHub REST API calls for existence checks (rate-limit prone).
+    # Use `git ls-remote` to test repo reachability; only fall back to REST
+    # when we actually need to CREATE the repository.
+    token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+    else:
+        url = f"https://github.com/{owner}/{repo}.git"
+    p = run(["git", "ls-remote", "-q", url], check=False)
+    if p.returncode == 0:
         return
+    # If ls-remote failed for a reason other than non-existence, surface it.
+    # Typical non-existence: "Repository not found".
+    err = (p.stderr or "").lower()
+    # If authentication failed, don't try to create; bubble up clearly.
+    if "authentication" in err or "403" in err:
+        raise RuntimeError(f"git ls-remote auth failed for {owner}/{repo}: {p.stderr[-500:]}")
+    if "not found" not in err and "repository" not in err:
+        raise RuntimeError(f"git ls-remote failed for {url}: {p.stderr[-500:] if p.stderr else p.stdout[-500:]}")
+
     log.info("Creating missing repo: %s/%s", owner, repo)
     gh_create_repo(owner, repo, description)
 
@@ -344,6 +382,12 @@ class RepoWriter:
         self._last_used_ts = time.time()
 
     def ensure_open(self) -> None:
+        # IMPORTANT: do *not* call GitHub REST API (repo exists / create) on every write.
+        # This crawler can write millions of files; an API call per file will quickly
+        # hit rate limits. We only ensure the repo + clone once per local worktree.
+        if self.local_path.exists() and (self.local_path / ".git").exists():
+            self.touch()
+            return
         ensure_repo(self.owner, self.repo, self.description)
         git_clone_or_init(self.owner, self.repo, self.local_path)
         self.touch()
@@ -595,6 +639,7 @@ def main() -> None:
     state.setdefault("cursors", {})
     tracker = RepoRolloverTracker(state)
     wm = WriterManager(OWNER, COMMIT_EVERY_FILES, MAX_OPEN_REPOS)
+    repos_seen: set[str] = set()
 
     log.info("Kalshi fan-out crawler | owner=%s", OWNER)
     log.info("base_url=%s", BASE_URL)
@@ -611,6 +656,7 @@ def main() -> None:
         for o in paginate("/series", "series"):
             rel = series_relpath(o)
             repo = pick_repo_for(rel, "series", tracker, wm)
+            repos_seen.add(repo)
             w = wm.get(repo, "Statground Kalshi series data")
             w.write_json(rel, o, "series")
             w.maybe_flush(False)
@@ -625,6 +671,7 @@ def main() -> None:
         for o in paginate("/events", "events"):
             rel = event_relpath(o)
             repo = pick_repo_for(rel, "event", tracker, wm)
+            repos_seen.add(repo)
             w = wm.get(repo, "Statground Kalshi events data")
             w.write_json(rel, o, "event")
             w.maybe_flush(False)
@@ -639,6 +686,7 @@ def main() -> None:
         for o in paginate("/markets", "markets"):
             rel = market_relpath(o)
             repo = pick_repo_for(rel, "market", tracker, wm)
+            repos_seen.add(repo)
             w = wm.get(repo, "Statground Kalshi markets data")
             w.write_json(rel, o, "market")
             w.maybe_flush(False)
@@ -651,8 +699,21 @@ def main() -> None:
 
         # final flush
         wm.flush_all()
+
+        # Write a manifest of repositories we touched this run.
+        # This is used by the stats generator to avoid GitHub REST API listing.
+        manifest = {
+            "updated_utc": dt_utc_now_str(),
+            "owner": OWNER,
+            "repos": sorted(repos_seen),
+        }
+        Path("KALSHI_REPOS.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
         state["completed_full"] = True
         save_state(state)
+
+        # Commit/push manifest + state updates in this control repo (Statground_Data_Kalshi)
+        git_commit_push_if_changed("kalshi: update manifest/state")
 
     except Exception as e:
         log.error("FATAL: %s", e, exc_info=True)
