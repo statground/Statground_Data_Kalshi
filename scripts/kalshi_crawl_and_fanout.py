@@ -58,6 +58,14 @@ NOW_UTC = dt.datetime.now(dt.timezone.utc)
 OWNER = os.environ.get("GITHUB_OWNER", "statground").strip()
 BASE_URL = os.environ.get("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2").strip()
 
+# The control repo is the repository where this crawler lives (Statground_Data_Kalshi).
+# We commit/push small state files (e.g., KALSHI_STATE.json) to it.
+_gh_repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()  # "owner/repo"
+if "/" in _gh_repo:
+    CONTROL_OWNER, CONTROL_REPO = _gh_repo.split("/", 1)
+else:
+    CONTROL_OWNER, CONTROL_REPO = OWNER, "Statground_Data_Kalshi"
+
 GH_PAT = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")  # allow either
 if not GH_PAT:
     raise RuntimeError("GH_PAT (or GITHUB_TOKEN) is required")
@@ -272,12 +280,15 @@ def ensure_repo(owner: str, repo: str, description: str = "") -> None:
     # Avoid GitHub REST API calls for existence checks (rate-limit prone).
     # Use `git ls-remote` to test repo reachability; only fall back to REST
     # when we actually need to CREATE the repository.
-    token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
-    if token:
-        url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-    else:
-        url = f"https://github.com/{owner}/{repo}.git"
-    p = run(["git", "ls-remote", "-q", url], check=False)
+    # First try without token. If repos are public, this avoids needless auth
+    # issues and never touches the REST API rate limit.
+    url_public = f"https://github.com/{owner}/{repo}.git"
+    p = run(["git", "ls-remote", "-q", url_public], check=False)
+    if p.returncode != 0:
+        token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            url_auth = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+            p = run(["git", "ls-remote", "-q", url_auth], check=False)
     if p.returncode == 0:
         return
     # If ls-remote failed for a reason other than non-existence, surface it.
@@ -287,7 +298,9 @@ def ensure_repo(owner: str, repo: str, description: str = "") -> None:
     if "authentication" in err or "403" in err:
         raise RuntimeError(f"git ls-remote auth failed for {owner}/{repo}: {p.stderr[-500:]}")
     if "not found" not in err and "repository" not in err:
-        raise RuntimeError(f"git ls-remote failed for {url}: {p.stderr[-500:] if p.stderr else p.stdout[-500:]}")
+        raise RuntimeError(
+            f"git ls-remote failed for {url_public}: {p.stderr[-500:] if p.stderr else p.stdout[-500:]}"
+        )
 
     log.info("Creating missing repo: %s/%s", owner, repo)
     gh_create_repo(owner, repo, description)
@@ -301,9 +314,35 @@ def run(cmd: List[str], cwd: Optional[Path] = None, check: bool = True) -> subpr
         log.debug("$ %s", " ".join(cmd))
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
     if check and p.returncode != 0:
-        tail = (p.stderr or "")[-500:]
+        # Emit a helpful tail for Actions logs (git often returns 128 with the real reason in stderr).
+        stderr_tail = (p.stderr or "").strip()[-1500:]
+        stdout_tail = (p.stdout or "").strip()[-1500:]
+        if stderr_tail:
+            log.error("stderr (tail): %s", stderr_tail)
+        if stdout_tail and VERBOSE_GIT:
+            log.error("stdout (tail): %s", stdout_tail)
         raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
     return p
+
+
+def _token() -> Optional[str]:
+    """Return a PAT used for GitHub API + git push. Prefer GH_PAT."""
+    return os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+
+
+def git_set_origin_with_token(repo_path: Path, owner: str, repo: str) -> None:
+    """Ensure origin URL includes token so `git push` works in GitHub Actions."""
+    tok = _token()
+    if not tok:
+        return
+    # Using x-access-token is the recommended format for HTTPS auth with PAT.
+    url = f"https://x-access-token:{tok}@github.com/{owner}/{repo}.git"
+    # Avoid logging token.
+    try:
+        run(["git", "remote", "set-url", "origin", url], cwd=repo_path, check=True)
+    except Exception:
+        # If remote doesn't exist yet (rare), add it.
+        run(["git", "remote", "add", "origin", url], cwd=repo_path, check=True)
 
 def remove_stale_git_locks(repo_path: Path) -> None:
     lock = repo_path / ".git" / "index.lock"
@@ -318,21 +357,50 @@ def git_setup_identity(repo_path: Path) -> None:
     run(["git", "config", "user.email", "actions@github.com"], cwd=repo_path, check=False)
     run(["git", "config", "user.name", "github-actions"], cwd=repo_path, check=False)
 
+def get_github_pat() -> Optional[str]:
+    """Return a GitHub token that has permission to push/create repos.
+
+    In this project we expect the user to store `GH_PAT` in GitHub Actions
+    Secrets and expose it as env var.
+    """
+    return os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+
+def remote_url(owner: str, repo: str, with_token: bool) -> str:
+    if with_token:
+        tok = get_github_pat()
+        if tok:
+            # Use x-access-token style to avoid username requirements.
+            return f"https://x-access-token:{tok}@github.com/{owner}/{repo}.git"
+    return f"https://github.com/{owner}/{repo}.git"
+
+def git_set_origin_url(repo_path: Path, owner: str, repo: str) -> None:
+    """Ensure origin uses an authenticated URL so `git push` works in Actions."""
+    url = remote_url(owner, repo, with_token=True)
+    # If no token, leave as-is.
+    if "x-access-token" not in url:
+        return
+    # set-url can fail if origin is missing; handle both.
+    p = run(["git", "remote", "set-url", "origin", url], cwd=repo_path, check=False)
+    if p.returncode != 0:
+        run(["git", "remote", "add", "origin", url], cwd=repo_path, check=False)
+
 def git_clone_or_init(owner: str, repo: str, local_path: Path) -> None:
-    url = f"https://github.com/{owner}/{repo}.git"
+    # Clone with token so the repo is immediately pushable.
+    url = remote_url(owner, repo, with_token=True)
     if local_path.exists():
         return
     local_path.parent.mkdir(parents=True, exist_ok=True)
     # shallow clone to keep disk low
     run(["git", "clone", "--depth", "1", url, str(local_path)], check=True)
     git_setup_identity(local_path)
+    git_set_origin_url(local_path, owner, repo)
 
 def git_has_changes(repo_path: Path) -> bool:
     remove_stale_git_locks(repo_path)
     p = run(["git", "status", "--porcelain"], cwd=repo_path, check=True)
     return bool(p.stdout.strip())
 
-def git_commit_push_if_changed(repo_path: Path, msg: str) -> bool:
+def git_commit_push_if_changed(repo_path: Path, msg: str, owner: str, repo: str) -> bool:
     remove_stale_git_locks(repo_path)
     if not git_has_changes(repo_path):
         return False
@@ -344,6 +412,8 @@ def git_commit_push_if_changed(repo_path: Path, msg: str) -> bool:
         if not git_has_changes(repo_path):
             return False
         raise subprocess.CalledProcessError(p.returncode, ["git", "commit"], output=p.stdout, stderr=p.stderr)
+    # Ensure authenticated origin for push (important on GitHub Actions).
+    git_set_origin_url(repo_path, owner, repo)
     # push
     run(["git", "push", "--quiet"], cwd=repo_path, check=True)
     return True
@@ -420,7 +490,7 @@ class RepoWriter:
         counts_path = self.local_path / "KALSHI_COUNTS.json"
         json_dump(counts_path, self.counts.to_dict())
         msg = f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})"
-        git_commit_push_if_changed(self.local_path, msg)
+        git_commit_push_if_changed(self.local_path, msg, self.owner, self.repo)
         self._since_commit = 0
 
     def close_and_delete(self) -> None:
@@ -713,7 +783,7 @@ def main() -> None:
         save_state(state)
 
         # Commit/push manifest + state updates in this control repo (Statground_Data_Kalshi)
-        git_commit_push_if_changed("kalshi: update manifest/state")
+        git_commit_push_if_changed(Path("."), "kalshi: update manifest/state", CONTROL_OWNER, CONTROL_REPO)
 
     except Exception as e:
         log.error("FATAL: %s", e, exc_info=True)
