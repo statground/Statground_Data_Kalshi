@@ -1,984 +1,674 @@
 #!/usr/bin/env python3
-"""Kalshi crawler + fan-out publisher (AUTO-CREATE repos) — STREAMING PUSH (QUIET + LOGFILE)
+# -*- coding: utf-8 -*-
 
-This version reduces GitHub Actions console output to avoid log truncation.
-- Console: periodic progress only
-- File: detailed log at .work/logs/kalshi_run.log
-- On error: prints last N lines of logfile to console
+"""
+Kalshi (elections) crawler + GitHub fan-out.
 
-Env:
-  GH_PAT (required)
-  KALSHI_COMMIT_EVERY_FILES=5000
-  KALSHI_MAX_OPEN_REPOS=3
-  KALSHI_PRINT_EVERY_ITEMS=100000
-  KALSHI_LOG_TAIL_ON_ERROR=200
-  KALSHI_VERBOSE_GIT=0
+Designed for GitHub Actions runners (limited disk).
+
+Features
+- Crawl: /series, /events, /markets
+- Write each object as one JSON file to GitHub repos.
+- Repo fan-out:
+    * Series:  Statground_Data_Kalshi_Series
+    * Events:  Statground_Data_Kalshi_Events_<YYYY>_<NNN> (preferred if year known)
+              Statground_Data_Kalshi_Events_Current_<NNN> (fallback)
+    * Markets: Statground_Data_Kalshi_Markets_<YYYY>_<NNN> (preferred if year known)
+              Statground_Data_Kalshi_Markets_Current_<NNN> (fallback)
+- Disk-based rollover:
+    * If disk free < DISK_FREE_MIN_BYTES: flush/push, close, and roll to next repo index when needed
+    * If repo local dir size > REPO_MAX_BYTES: roll to next repo index for that prefix
+- To keep disk low, when a repo is closed we delete its local clone directory.
+
+Environment variables (GitHub Actions)
+- GH_PAT (required): GitHub token with repo scopes
+- GITHUB_OWNER (optional, default "statground")
+- KALSHI_BASE_URL (optional)
+- COMMIT_EVERY_FILES (optional, default 5000)
+- MAX_OPEN_REPOS (optional, default 3)
+- REPO_MAX_BYTES (optional, default 6 GiB)
+- DISK_FREE_MIN_BYTES (optional, default 3 GiB)
+- ROLLOVER_SUFFIX_WIDTH (optional, default 3)
+- VERBOSE_GIT (optional "1" to show git stdout)
 """
 
+from __future__ import annotations
+
 import os
+import sys
+import json
+import time
+import math
 import shutil
-import hashlib, re, json, time, datetime, shutil, subprocess, logging
+import hashlib
+import logging
+import subprocess
+import datetime as dt
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-from collections import OrderedDict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
-NOW_UTC = datetime.datetime.now(datetime.timezone.utc)
+# -----------------------------
+# Globals / Config
+# -----------------------------
 
-ORCH_ROOT = Path(".")
-STATE_DIR = ORCH_ROOT / ".state"
-STATE_FILE = STATE_DIR / "kalshi_state.json"
-TARGETS_FILE = STATE_DIR / "kalshi_targets.json"
+NOW_UTC = dt.datetime.now(dt.timezone.utc)
+OWNER = os.environ.get("GITHUB_OWNER", "statground").strip()
+BASE_URL = os.environ.get("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2").strip()
 
-WORK_DIR = ORCH_ROOT / ".work"
-REPOS_DIR = WORK_DIR / "repos"
+GH_PAT = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")  # allow either
+if not GH_PAT:
+    raise RuntimeError("GH_PAT (or GITHUB_TOKEN) is required")
+
+COMMIT_EVERY_FILES = int(os.environ.get("COMMIT_EVERY_FILES", "5000"))
+MAX_OPEN_REPOS = int(os.environ.get("MAX_OPEN_REPOS", "3"))
+VERBOSE_GIT = os.environ.get("VERBOSE_GIT", "0").strip() == "1"
+
+REPO_MAX_BYTES = int(os.environ.get("REPO_MAX_BYTES", str(6 * 1024**3)))          # 6 GiB
+DISK_FREE_MIN_BYTES = int(os.environ.get("DISK_FREE_MIN_BYTES", str(3 * 1024**3)))# 3 GiB
+ROLLOVER_SUFFIX_WIDTH = int(os.environ.get("ROLLOVER_SUFFIX_WIDTH", "3"))
+
+WORK_DIR = Path(".work")
+WORK_DIR.mkdir(exist_ok=True)
 LOG_DIR = WORK_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "kalshi_run.log"
 
-LIMITS = {"events": 200, "markets": 1000}
-EVENTS_BASE_PARAMS = {"with_nested_markets": "true"}
+WORK_REPOS_DIR = WORK_DIR / "repos"
+WORK_REPOS_DIR.mkdir(exist_ok=True)
 
-LOG_EVERY = int(os.getenv("KALSHI_LOG_EVERY", "50"))
-SLEEP_SEC = float(os.getenv("KALSHI_SLEEP_SEC", "0.02"))
+STATE_PATH = WORK_DIR / "kalshi_state.json"
 
-COMMIT_EVERY_FILES = int(os.getenv("KALSHI_COMMIT_EVERY_FILES", "5000"))
-MAX_OPEN_REPOS = int(os.getenv("KALSHI_MAX_OPEN_REPOS", "3"))
+UA = "statground-kalshi-crawler/1.0"
 
-# Rollover / disk safety
-# - We cap per-repo growth (approx by bytes written and file count) to avoid exhausting the runner disk and git index limits.
-# - "bytes written" is an approximation (JSON+meta payload sizes) but tracks disk growth closely enough for rollovers.
-MAX_BYTES_PER_REPO = int(os.getenv("KALSHI_MAX_BYTES_PER_REPO", str(3_000_000_000)))  # ~3GB
-MAX_FILES_PER_REPO = int(os.getenv("KALSHI_MAX_FILES_PER_REPO", str(250_000)))
-MIN_FREE_GB = float(os.getenv("KALSHI_MIN_FREE_GB", "2.0"))  # global free space guardrail
+# -----------------------------
+# Logging
+# -----------------------------
 
-GIT_PUSH_EVERY_SEC = int(os.getenv("KALSHI_GIT_PUSH_EVERY_SEC", "0"))
+def get_logger() -> logging.Logger:
+    log = logging.getLogger("kalshi")
+    if log.handlers:
+        return log
 
-PRINT_EVERY_ITEMS = int(os.getenv("KALSHI_PRINT_EVERY_ITEMS", "100000"))
-LOG_TAIL_ON_ERROR = int(os.getenv("KALSHI_LOG_TAIL_ON_ERROR", "200"))
-VERBOSE_GIT = os.getenv("KALSHI_VERBOSE_GIT", "0").strip() == "1"
-
-GH_PAT = os.getenv("GH_PAT", "").strip()
-if not GH_PAT:
-    raise RuntimeError("GH_PAT is required. Add it as Actions Secret 'GH_PAT'.")
-
-GIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", "github-actions[bot]")
-GIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "github-actions[bot]@users.noreply.github.com")
-
-GITHUB_API = "https://api.github.com"
-DEFAULT_VISIBILITY_PRIVATE = False
-
-def setup_logging():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("kalshi")
-    logger.setLevel(logging.DEBUG)
+    log.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    ch = logging.StreamHandler()
+    # console
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    log.addHandler(ch)
+    # file
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
-
-log = setup_logging()
-
-
-def get_logger() -> logging.Logger:
-    """Return the module logger.
-
-    Earlier iterations of this script referenced get_logger() from main().
-    Keep this helper for backwards-compatibility.
-    """
+    log.addHandler(fh)
     return log
 
-def tail_file(path: Path, n: int) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        return "".join(lines[-n:])
-    except Exception as e:
-        return f"(failed to read log tail: {e})"
 
-def make_session():
-    s = requests.Session()
-    retry = Retry(
-        total=10,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    return s
+log = get_logger()
 
-SESSION = make_session()
+# -----------------------------
+# Utilities
+# -----------------------------
 
-def kalshi_get_json(path: str, params: Optional[dict] = None) -> dict:
-    r = SESSION.get(f"{BASE_URL}{path}", params=params or {}, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Kalshi HTTP {r.status_code}: {r.text[:800]}")
-    return r.json()
+def disk_free_bytes(path: Path) -> int:
+    usage = shutil.disk_usage(str(path))
+    return usage.free
 
-def gh_headers():
-    return {
-        "Authorization": f"Bearer {GH_PAT}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "statground-kalshi-orchestrator",
-    }
+def dir_size_bytes(path: Path, stop_at: Optional[int] = None) -> int:
+    """Compute directory size. If stop_at is set, stop once size exceeds it (best-effort)."""
+    total = 0
+    if not path.exists():
+        return 0
+    # iterative walk, fast-ish
+    for root, dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                fp = Path(root) / fn
+                total += fp.stat().st_size
+                if stop_at is not None and total > stop_at:
+                    return total
+            except FileNotFoundError:
+                continue
+    return total
 
-def gh_backoff_if_rate_limited(resp: requests.Response):
-    if resp.status_code != 403:
-        return
-    if "rate limit exceeded" not in (resp.text or "").lower():
-        return
-    reset = resp.headers.get("x-ratelimit-reset")
-    remaining = resp.headers.get("x-ratelimit-remaining")
-    try:
-        reset_ts = int(reset) if reset else None
-    except Exception:
-        reset_ts = None
-    now = int(time.time())
-    wait = min(60, max(5, (reset_ts - now + 2) if reset_ts and reset_ts > now else 30))
-    log.warning("GitHub API rate limit hit (remaining=%s). Sleeping %ss and retrying...", remaining, wait)
-    time.sleep(wait)
+def sha1_short(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
-def gh_get(url: str) -> requests.Response:
-    r = SESSION.get(url, headers=gh_headers(), timeout=60)
-    if r.status_code == 403 and "rate limit exceeded" in (r.text or "").lower():
-        gh_backoff_if_rate_limited(r)
-        r = SESSION.get(url, headers=gh_headers(), timeout=60)
-    return r
+def ensure_parent(p: Path) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
 
-def gh_post(url: str, payload: dict) -> requests.Response:
-    r = SESSION.post(url, headers=gh_headers(), json=payload, timeout=60)
-    if r.status_code == 403 and "rate limit exceeded" in (r.text or "").lower():
-        gh_backoff_if_rate_limited(r)
-        r = SESSION.post(url, headers=gh_headers(), json=payload, timeout=60)
-    return r
-
-def sanitize(s):
-    return re.sub(r"_+", "_", re.sub(r"[^\w\-.]+", "_", str(s)))[:180]
-
-def parse_ym(v) -> Tuple[str, str]:
-    try:
-        if isinstance(v, (int, float)):
-            if v > 1e12:
-                v /= 1000
-            dt = datetime.datetime.utcfromtimestamp(v)
-        else:
-            dt = datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        return f"{dt.year:04d}", f"{dt.month:02d}"
-    except Exception:
-        return "unknown", "unknown"
-
-def iso_to_unix_seconds(v) -> Optional[int]:
-    if not v:
-        return None
-    try:
-        dt = datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except Exception:
-        return None
-
-def pick_ticker(o, keys):
-    for k in keys:
-        if o.get(k):
-            return sanitize(o[k])
-    return sanitize(abs(hash(json.dumps(o, sort_keys=True))))
-
-def shard2(s: str) -> str:
-    """Return a stable 2-char shard key to avoid huge directories on GitHub."""
-    s = sanitize(s)
-    if not s:
-        return "00"
-    # Use first 2 chars if alnum-heavy, else hash for better spread.
-    head = s[:2].lower()
-    if re.match(r"^[a-z0-9]{2}$", head):
-        return head
-    h = hashlib.sha1(s.encode("utf-8")).hexdigest()
-    return h[:2]
-
-def atomic_write_json(path: Path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def json_dump(path: Path, obj: Any) -> None:
+    ensure_parent(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False), encoding="utf-8")
     tmp.replace(path)
 
-def rm_rf(p: Path):
-    if p.exists():
-        # Runner can keep temporary git files for a short time.
-        shutil.rmtree(p, ignore_errors=True)
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.load(open(STATE_FILE, "r", encoding="utf-8"))
-    return {
-        "last_run_ts": None,
-        "last_market_updated_ts": None,
-        "first_full_done": False,
-        "events_cursor": None,
-        "events_page": 0,
-        "events_total": 0,
-        "markets_cursor": None,
-        "markets_page": 0,
-        "markets_total": 0,
-    }
-
-def save_state(state: dict):
-    state = dict(state)
-    state["last_success_utc"] = NOW_UTC.isoformat()
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(STATE_FILE, state)
-
-def default_targets() -> dict:
-    owner = os.getenv("GITHUB_REPOSITORY_OWNER", "statground")
-    return {
-        "owner": owner,
-        "series_repo": "Statground_Data_Kalshi_Series",
-        # Repositories are split by entity type (Events / Markets / Series) and by scope (Current / year),
-        # and additionally use a rollover index suffix (_001, _002, ...) to stay disk-safe.
-        "repo_prefix": "Statground_Data_Kalshi",
-    }
-
-def load_targets() -> dict:
-    if TARGETS_FILE.exists():
-        return json.load(open(TARGETS_FILE, "r", encoding="utf-8"))
-    return default_targets()
-
-def save_targets(targets: dict):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(TARGETS_FILE, targets)
-
-_owner_type_cache: Dict[str, str] = {}
-_repo_exists_cache: Dict[Tuple[str, str], bool] = {}
-_repo_ensured: set = set()
-
-
-
-
-def target_repo_for_relpath(rel, tracker: "RepoRolloverTracker", targets: dict):
-    """Return (repo, kind, scope) for a given relative path."""
-    if not isinstance(rel, str):
-        rel = str(rel)
-    rel = rel.lstrip("/")
-
-    # Series always lives in a single repo
-    if rel.startswith("series/"):
-        return targets["series_repo"], "Series", "All"
-
-    # Events: events/{open|closed}/YYYY/... OR events/{open|closed}/unknown/...
-    if rel.startswith("events/"):
-        parts = rel.split("/")
-        year = parts[2] if len(parts) > 2 else "unknown"
-        scope = "Current" if year in ("unknown", "current") else year
-        return tracker.repo("Events", scope), "Events", scope
-
-    # Markets: markets/{open|closed}/YYYY/... OR markets/{open|closed}/unknown/...
-    if rel.startswith("markets/"):
-        parts = rel.split("/")
-        year = parts[2] if len(parts) > 2 else "unknown"
-        scope = "Current" if year in ("unknown", "current") else year
-        return tracker.repo("Markets", scope), "Markets", scope
-
-    # Fallback: keep unknowns with Events_Current
-    return tracker.repo("Events", "Current"), "Events", "Current"
-
-
-class RepoRolloverTracker:
-    """Decides which numbered repo (_001, _002, ...) to write into.
-
-    Rollover triggers (any of):
-      - per-repo JSON file count reaches MAX_FILES_PER_REPO
-      - tracked bytes reaches MAX_BYTES_PER_REPO
-      - free disk on the runner under WORK_DIR drops below MIN_FREE_GB
-
-    We track counts in the state file so restarts keep using the same suffix.
-    """
-
-    def __init__(self, repo_prefix: str, state: dict):
-        self.repo_prefix = repo_prefix
-        self.state = state.setdefault("rollover", {})
-        self.suffix_width = int(ROLLOVER_SUFFIX_WIDTH)
-
-    def _key(self, kind: str, scope: str) -> str:
-        return f"{kind}:{scope}"
-
-    def _get_entry(self, kind: str, scope: str) -> dict:
-        k = self._key(kind, scope)
-        ent = self.state.get(k)
-        if not ent:
-            ent = {"idx": 1, "files": 0, "bytes": 0}
-            self.state[k] = ent
-        return ent
-
-    def _repo_name(self, kind: str, scope: str, idx: int) -> str:
-        return f"{self.repo_prefix}_{kind}_{scope}_{idx:0{self.suffix_width}d}"
-
-    def repo(self, kind: str, scope: str) -> str:
-        ent = self._get_entry(kind, scope)
-
-        # Disk-based rollover (runner safety)
-        if disk_free_gb(WORK_DIR) < float(MIN_FREE_GB):
-            ent["idx"] += 1
-            ent["files"] = 0
-            ent["bytes"] = 0
-
-        # Repo-size rollover (approx via counters)
-        if ent["files"] >= int(MAX_FILES_PER_REPO) or ent["bytes"] >= int(MAX_BYTES_PER_REPO):
-            ent["idx"] += 1
-            ent["files"] = 0
-            ent["bytes"] = 0
-
-        # Reserve one slot for the next file
-        ent["files"] += 1
-        return self._repo_name(kind, scope, ent["idx"])
-
-    def record_bytes(self, kind: str, scope: str, nbytes: int):
-        ent = self._get_entry(kind, scope)
-        ent["bytes"] += int(nbytes)
-def gh_owner_type(owner: str) -> str:
-    if owner in _owner_type_cache:
-        return _owner_type_cache[owner]
-    r = gh_get(f"{GITHUB_API}/users/{owner}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"GitHub: cannot read owner '{owner}': {r.status_code} {r.text[:300]}")
-    t = r.json().get("type", "User")
-    _owner_type_cache[owner] = t
-    return t
-
-def gh_repo_exists(owner: str, repo: str, refresh: bool = False) -> bool:
-    """Return True if the GitHub repo exists.
-
-    Note: during long-running crawls we can hit eventual-consistency / race
-    conditions where a repo is created and becomes visible a bit later.
-    When `refresh=True`, we bypass the local cache and re-check GitHub.
-    """
-    k = (owner, repo)
-    if (not refresh) and (k in _repo_exists_cache):
-        return _repo_exists_cache[k]
-    r = gh_get(f"{GITHUB_API}/repos/{owner}/{repo}")
-    if r.status_code == 200:
-        _repo_exists_cache[k] = True
-        return True
-    if r.status_code == 404:
-        _repo_exists_cache[k] = False
-        return False
-
-    # Any other response is unexpected (rate-limit, auth, GitHub outage, etc.).
-    raise RuntimeError(
-        f"GitHub: repo check failed {owner}/{repo}: {r.status_code} {r.text[:300]}"
-    )
-
-def gh_create_repo(owner: str, repo: str, description: str = ""):
-    """Create a GitHub repo if needed.
-
-    GitHub's create-repo endpoint can return 422 for several reasons, including
-    'name already exists' or transient validation/race conditions. We treat any
-    422 as 'maybe already exists' and re-check existence before failing.
-    """
-    url = "https://api.github.com/user/repos"
-    payload = {"name": repo, "private": False, "description": description}
-
-    def _post():
-        return gh_post(url, payload)
-
-    r = _post()
-    if r.status_code in (201, 202):
-        return
-
-    if r.status_code == 422:
-        # Race / eventual consistency / name already exists.
-        for delay_s in (0, 1, 2, 4):
-            if delay_s:
-                time.sleep(delay_s)
-            try:
-                # refresh=True to bypass negative cache in long-running jobs
-                # (the repo might have been created moments ago by another run).
-                if gh_repo_exists(owner, repo, refresh=True):
-                    log.info("Repo already exists (create returned 422): %s/%s", owner, repo)
-                    _repo_exists_cache[(owner, repo)] = True
-                    return
-            except Exception:
-                pass
-
-        # One more retry of creation, then re-check.
-        for delay_s in (2, 4):
-            time.sleep(delay_s)
-            r2 = _post()
-            if r2.status_code in (201, 202):
-                return
-            try:
-                if gh_repo_exists(owner, repo, refresh=True):
-                    log.info("Repo exists after retry (create returned 422): %s/%s", owner, repo)
-                    _repo_exists_cache[(owner, repo)] = True
-                    return
-            except Exception:
-                pass
-
-        # Fall through: genuine validation failure.
-        raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
-
-    raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
-def ensure_repo(owner: str, repo: str, description: str = ""):
-    k = (owner, repo)
-    if k in _repo_ensured:
-        return
-    if gh_repo_exists(owner, repo):
-        _repo_ensured.add(k)
-        return
-    log.info("Creating missing repo: %s/%s", owner, repo)
-    # gh repo create requires --description, but we sometimes create repos
-    # dynamically (e.g., sharded buckets) where a verbose description is not
-    # necessary. Use an empty string in that case.
-    gh_create_repo(owner, repo, description or "")
-    _repo_ensured.add(k)
-
-def series_relpath(o) -> Path:
-    cat = sanitize((o.get("category") or "uncategorized").lower())
-    sub = sanitize((o.get("subcategory") or "uncategorized").lower())
-    t = pick_ticker(o, ["series_ticker", "ticker", "id"])
-    return Path("series") / "by_category" / cat / sub / f"{t}.json"
-
-
-OPEN_STATUSES = {"open", "active", "trading", "live"}
-
-
-def _best_dt(o: dict, keys: list[str]) -> datetime.datetime | None:
-    for k in keys:
-        dt = _dt_from_any(o.get(k))
-        if dt is not None:
-            return dt
-    return None
-
-
-# Backward-compatible alias (older revisions used _pick_dt)
-_pick_dt = _best_dt
-
-
-def events_relpath(o) -> Path:
-    """Shard events by status + YYYY/MM + 2-char prefix to avoid huge git trees."""
-    status = (o.get("status") or "").lower()
-    t = pick_ticker(o, ["ticker", "event_ticker", "id"])
-
-    dt = _best_dt(
-        o,
-        [
-            "strike_date",
-            "close_time",
-            "expiration_time",
-            "settlement_time",
-            "created_time",
-            "created_at",
-            "updated_time",
-            "updated_at",
-        ],
-    )
-    y, m = _ym_from_dt(dt)
-    p2 = _shard2(t)
-
-    if status in OPEN_STATUSES:
-        return Path("events") / "open" / y / m / p2 / f"{t}.json"
-    return Path("events") / "closed" / y / m / p2 / f"{t}.json"
-
-
-def markets_relpath(o) -> Path:
-    """Shard markets by status + YYYY/MM + 2-char prefix to avoid huge git trees."""
-    status = (o.get("status") or "").lower()
-    t = pick_ticker(o, ["ticker", "market_ticker", "id"])
-
-    # Prefer a stable time for bucketing: close/expiration for closed,
-    # updated/open time for open.
-    dt = _best_dt(
-        o,
-        [
-            "close_time",
-            "expiration_time",
-            "settlement_time",
-            "created_time",
-            "created_at",
-            "updated_time",
-            "updated_at",
-            "strike_date",
-        ],
-    )
-    y, m = _ym_from_dt(dt)
-    p2 = _shard2(t)
-
-    if status == "open":
-        return Path("markets") / "open" / y / m / p2 / f"{t}.json"
-    return Path("markets") / "closed" / y / m / p2 / f"{t}.json"
-
-
-def _dt_from_any(v) -> datetime.datetime | None:
-    """Best-effort parse of Kalshi-ish datetime values.
-
-    Accepts:
-      - ISO8601 strings (with or without Z, with or without timezone)
-      - YYYY-MM-DD strings
-      - unix epoch seconds/milliseconds
-    """
-    if v is None:
-        return None
+def safe_int(x: Any) -> Optional[int]:
     try:
-        # epoch seconds / ms
-        if isinstance(v, (int, float)):
-            ts = float(v)
-            if ts > 10_000_000_000:  # ms
-                ts = ts / 1000.0
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        if not isinstance(v, str):
+        if x is None:
             return None
-
-        s = v.strip()
+        if isinstance(x, bool):
+            return int(x)
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).strip()
         if not s:
             return None
-        # date only
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
-        # normalize Z
-        s2 = s.replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(s2)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            return None
+        return int(float(s))
     except Exception:
         return None
 
+def parse_dt_from_any(obj: Dict[str, Any]) -> Optional[dt.datetime]:
+    """Try multiple candidate fields to infer created datetime."""
+    candidates = [
+        "created_time", "createdTime", "created_ts", "created_at",
+        "open_time", "openTime", "last_updated_time", "updated_time",
+        "close_time", "closeTime",
+    ]
+    for k in candidates:
+        if k not in obj:
+            continue
+        v = obj.get(k)
+        if v is None:
+            continue
 
-def _best_dt(o: dict, keys: list[str]) -> datetime.datetime | None:
-    for k in keys:
-        if k in o and o.get(k) not in (None, ""):
-            dt = _dt_from_any(o.get(k))
-            if dt is not None:
-                return dt
-    return None
-
-
-# Backward-compatible alias (older revisions used _pick_dt)
-_pick_dt = _best_dt
-
-
-def _ym_from_dt(dt: datetime.datetime | None) -> tuple[str, str]:
-    if dt is None:
-        return ("unknown", "unknown")
-    return (f"{dt.year:04d}", f"{dt.month:02d}")
-
-
-def _shard2(s: str) -> str:
-    """2-hex shard from SHA1(s). Stable and evenly distributed (avoids huge trees when tickers share prefixes like '2026...')."""
-    s = sanitize(s)
-    if not s:
-        return "00"
-    h = hashlib.sha1(s.encode("utf-8")).hexdigest()
-    return h[:2]
-
-def disk_free_gb(path: str) -> float:
-    """Return free disk space in GB for the filesystem containing `path`."""
-    try:
-        du = shutil.disk_usage(path)
-        return du.free / (1024**3)
-    except Exception:
-        return 0.0
-def run(cmd, cwd=None, check=True, echo_to_console=False):
-    """Run a command.
-    - Always log command line to logfile
-    - Capture stdout/stderr and append to logfile (DEBUG)
-    - Optionally echo command line to console (INFO)
-    """
-    log.debug("$ %s", " ".join(cmd))
-    if echo_to_console or VERBOSE_GIT:
-        log.info("$ %s", " ".join(cmd))
-
-    p = subprocess.run(
-        cmd,
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-    )
-    out = (p.stdout or "").strip()
-    err = (p.stderr or "").strip()
-
-    if out:
-        log.debug("[stdout] %s", out if len(out) < 8000 else out[:8000] + "...(truncated)")
-    if err:
-        log.debug("[stderr] %s", err if len(err) < 8000 else err[:8000] + "...(truncated)")
-
-    if check and p.returncode != 0:
-        # log a concise error line too
-        log.error("Command failed (%s): %s", p.returncode, " ".join(cmd))
-        if err:
-            log.error("stderr (tail): %s", err[-2000:])
-        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
-
-    return p
-
-def repo_remote_url(owner: str, repo: str) -> str:
-    return f"https://x-access-token:{GH_PAT}@github.com/{owner}/{repo}.git"
-
-def git_config_identity(repo_path: Path):
-    run(["git", "config", "user.name", GIT_AUTHOR_NAME], cwd=repo_path)
-    run(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_path)
-
-def _chunked(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i + n]
-
-
-def git_commit_push_if_changed(repo_path: Path, msg: str, paths: list[str] | None = None):
-    # stage
-    if paths:
-        # Avoid `git add -A` on huge repos; only stage what we wrote.
-        for chunk in _chunked(paths, 4000):
-            run(["git", "add", "--"] + chunk, cwd=repo_path)
-    else:
-        run(["git", "add", "-A"], cwd=repo_path)
-
-    # if nothing staged, stop
-    r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_path)
-    if r.returncode == 0:
-        return False
-
-    # commit
-    run(["git", "commit", "--quiet", "-m", msg], cwd=repo_path)
-
-    # IMPORTANT: actions/checkout may set http.https://github.com/.extraheader (GITHUB_TOKEN).
-    # That can conflict with PAT-based push to other repos. Remove it locally before pushing.
-    try:
-        run(["git", "config", "--local", "--unset-all", "http.https://github.com/.extraheader"], cwd=repo_path, check=False)
-    except Exception:
-        pass
-
-    # Also force-empty extra header for this push to prevent leakage.
-    # (Git supports -c http.extraHeader= to override header for a single command.)
-    # Push with retries (handles transient network errors and non-fast-forward when jobs overlap)
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            run(["git", "-c", "http.extraHeader=", "push"], cwd=repo_path)
-            last_err = None
-            break
-        except subprocess.CalledProcessError as e:
-            last_err = e
-            err = (e.stderr or "").lower()
-            # Common overlap case: remote has new commits (non-fast-forward)
-            if "non-fast-forward" in err or "failed to push some refs" in err:
-                log.warning("push rejected (non-fast-forward). Attempting pull --rebase then retry (%s/3)...", attempt)
-                run(["git", "-c", "http.extraHeader=", "pull", "--rebase"], cwd=repo_path, check=False)
-            # Transient network/HTTP
-            elif "rpc failed" in err or "connection" in err or "timeout" in err or "http 5" in err:
-                log.warning("push transient error. Sleeping and retrying (%s/3)...", attempt)
-                time.sleep(5 * attempt)
-            else:
-                log.warning("push failed (attempt %s/3). stderr tail: %s", attempt, (e.stderr or "")[-800:])
-                time.sleep(2)
-    if last_err is not None:
-        raise last_err
-
-    return True
-
-
-class RolloverRequested(Exception):
-    """Internal signal: current writer hit rollover threshold."""
-    pass
-
-
-class RepoWriter:
-    def __init__(self, owner: str, repo: str, local_path: str, tracker: RepoRolloverTracker):
-        self.owner = owner
-        self.repo = repo
-        self.local_path = local_path
-        self.tracker = tracker
-        self.files_written = 0
-        self.last_flush_files = 0
-        self._opened = False
-        # Only stage/commit files we write in this process. This avoids staging deletions
-        # when we clean up local files to keep runner disk usage low.
-        self._pending_paths: list[str] = []
-
-    def open(self):
-        if self._opened:
-            return
-        ensure_local_repo(self.owner, self.repo, self.local_path)
-        self._opened = True
-
-    def write_json(self, relpath: str, obj: dict, pretty: bool = False):
-        self.open()
-        p = Path(self.local_path) / relpath
-        p.parent.mkdir(parents=True, exist_ok=True)
-
-        data = json.dumps(obj, ensure_ascii=False, indent=(2 if pretty else None), sort_keys=False)
-        raw = (data + "\n").encode("utf-8")
-        p.write_bytes(raw)
-        self.files_written += 1
-        self._pending_paths.append(relpath)
-        return len(raw)
-
-    def maybe_flush(self, force: bool):
-        # Flush when we have enough pending files or on force.
-        if not self._opened:
-            return
-        pending = len(self._pending_paths)
-        if not force and pending < COMMIT_EVERY_FILES:
-            return
-
-        # Always include counts file if present
-        counts_path = "KALSHI_COUNTS.json"
-        if (Path(self.local_path) / counts_path).exists():
-            self._pending_paths.append(counts_path)
-
-        # De-duplicate and chunk git add to avoid command length limits
-        unique_paths = []
-        seen = set()
-        for rp in self._pending_paths:
-            if rp not in seen:
-                seen.add(rp)
-                unique_paths.append(rp)
-
-        changed = git_commit_push_if_changed(
-            self.local_path,
-            f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})",
-            paths=unique_paths,
-        )
-
-        # After push, aggressively delete data files from local worktree to keep runner disk usage low.
-        # We DO NOT stage these deletions (since we only 'git add' the paths above), so remote history is preserved.
-        if changed:
-            for rp in unique_paths:
-                if rp == counts_path:
-                    continue
-                fp = Path(self.local_path) / rp
+        # unix seconds?
+        n = safe_int(v)
+        if n is not None:
+            # heuristics: milliseconds?
+            if n > 10_000_000_000:  # ms
+                n = n // 1000
+            if 0 < n < 4_000_000_000:
                 try:
-                    if fp.exists() and fp.is_file():
-                        fp.unlink()
+                    return dt.datetime.fromtimestamp(n, tz=dt.timezone.utc)
                 except Exception:
                     pass
-            # Best-effort: remove empty directories
+
+        # ISO string?
+        if isinstance(v, str):
+            s = v.strip()
+            # allow trailing Z
             try:
-                for root, dirs, files in os.walk(self.local_path, topdown=False):
-                    if root.endswith(os.sep + ".git") or f"{os.sep}.git{os.sep}" in root:
-                        continue
-                    if not dirs and not files:
-                        try:
-                            os.rmdir(root)
-                        except Exception:
-                            pass
+                if s.endswith("Z"):
+                    s2 = s[:-1] + "+00:00"
+                else:
+                    s2 = s
+                return dt.datetime.fromisoformat(s2)
             except Exception:
                 pass
+    return None
 
-        self.last_flush_files = self.files_written
-        self._pending_paths = []
+def yyyymm_from_obj(obj: Dict[str, Any]) -> Tuple[str, str]:
+    d = parse_dt_from_any(obj)
+    if not d:
+        return ("unknown", "unknown")
+    return (f"{d.year:04d}", f"{d.month:02d}")
 
-    def close(self):
-        try:
-            self.maybe_flush(True)
-        finally:
-            # Always remove local worktree to free runner disk
-            try:
-                shutil.rmtree(self.local_path, ignore_errors=True)
-            except Exception:
-                pass
-class WriterManager:
-    """Manages a small number of open local git worktrees to stay within runner disk limits."""
+def normalize_rel(rel: Any) -> str:
+    # rel may come as Path or str
+    if isinstance(rel, Path):
+        rel = rel.as_posix()
+    rel = str(rel)
+    rel = rel.lstrip("/")
+    return rel
 
-    def __init__(self, owner: str, tracker: RepoRolloverTracker, max_open_repos: int = MAX_OPEN_REPOS):
-        self.owner = owner
-        self.tracker = tracker
-        self.max_open_repos = max_open_repos
-        self.writers: dict[str, RepoWriter] = {}
-        self.open_order: list[str] = []  # LRU-ish
+# -----------------------------
+# GitHub API helpers
+# -----------------------------
 
-    def get(self, repo: str) -> RepoWriter:
-        if repo in self.writers:
-            # touch for LRU
-            if repo in self.open_order:
-                self.open_order.remove(repo)
-            self.open_order.append(repo)
-            return self.writers[repo]
+GH_API = "https://api.github.com"
 
-        # Evict if needed
-        while len(self.open_order) >= self.max_open_repos:
-            evict_repo = self.open_order.pop(0)
-            w = self.writers.pop(evict_repo, None)
-            if w:
-                log.info("Closing repo: %s", evict_repo)
-                w.close()
-
-        local_path = str(REPOS_DIR / repo)
-        w = RepoWriter(self.owner, repo, local_path, self.tracker)
-        w.open()
-        self.writers[repo] = w
-        self.open_order.append(repo)
-        return w
-
-    
-    def flush_all(self):
-        for repo in list(self.open_order):
-            w = self.writers.get(repo)
-            if w:
-                try:
-                    w.maybe_flush(force=True)
-                except RolloverRequested:
-                    # If flush triggers rollover, just close; next write will open new repo.
-                    w.close()
-                    self.writers.pop(repo, None)
-                    if repo in self.open_order:
-                        self.open_order.remove(repo)
-
-    def close_all(self):
-        for repo in list(self.open_order):
-            w = self.writers.get(repo)
-            if w:
-                log.info("Closing repo: %s", repo)
-                w.close()
-        self.writers.clear()
-        self.open_order.clear()
-
-
-
-def crawl_series_all(yield_item) -> int:
-    data = kalshi_get_json("/series", params={})
-    items = data.get("series", [])
-    for o in items:
-        yield_item(series_relpath(o), o)
-    return len(items)
-
-def crawl_events_full(yield_item, state: dict) -> int:
-    cursor = state.get("events_cursor")
-    page = int(state.get("events_page") or 0)
-    total = int(state.get("events_total") or 0)
-    log.info("[events:full] resume page=%s cursor=%s total=%s", f"{page:,}", "YES" if cursor else "NO", f"{total:,}")
-    while True:
-        params = dict(EVENTS_BASE_PARAMS); params["limit"] = LIMITS["events"]
-        if cursor: params["cursor"] = cursor
-        data = kalshi_get_json("/events", params=params)
-        items = data.get("events", []); next_cursor = data.get("cursor")
-        if not items and not next_cursor: break
-        for o in items: yield_item(events_relpath(o), o)
-        total += len(items); page += 1; cursor = next_cursor
-        state.update({"events_cursor": cursor, "events_page": page, "events_total": total}); save_state(state)
-        if page % LOG_EVERY == 0: log.info("[events:full] page=%s total=%s", f"{page:,}", f"{total:,}")
-        if not cursor: break
-        time.sleep(SLEEP_SEC)
-    state["events_cursor"] = None; save_state(state)
-    return total
-
-def crawl_markets_full(yield_item, state: dict) -> int:
-    cursor = state.get("markets_cursor")
-    page = int(state.get("markets_page") or 0)
-    total = int(state.get("markets_total") or 0)
-    max_seen_updated = int(state.get("last_market_updated_ts") or 0)
-    log.info("[markets:full] resume page=%s cursor=%s total=%s", f"{page:,}", "YES" if cursor else "NO", f"{total:,}")
-    while True:
-        params = {"limit": LIMITS["markets"]}
-        if cursor: params["cursor"] = cursor
-        data = kalshi_get_json("/markets", params=params)
-        items = data.get("markets", []); next_cursor = data.get("cursor")
-        if not items and not next_cursor: break
-        for o in items:
-            yield_item(markets_relpath(o), o)
-            u = iso_to_unix_seconds(o.get("updated_time"))
-            if u and u > max_seen_updated: max_seen_updated = u
-        total += len(items); page += 1; cursor = next_cursor
-        state.update({"markets_cursor": cursor, "markets_page": page, "markets_total": total, "last_market_updated_ts": max_seen_updated}); save_state(state)
-        if page % LOG_EVERY == 0: log.info("[markets:full] page=%s total=%s", f"{page:,}", f"{total:,}")
-        if not cursor: break
-        time.sleep(SLEEP_SEC)
-    state["markets_cursor"] = None
-    state["last_market_updated_ts"] = max_seen_updated or int(NOW_UTC.timestamp())
-    save_state(state)
-    return total
-
-
-def main():
-    log = get_logger()
-    state = load_state()
-
-    owner = os.environ.get("GH_OWNER", "statground")
-    repo_prefix = os.environ.get("REPO_PREFIX", "Statground_Data_Kalshi")
-
-    targets = {
-        "repo_prefix": repo_prefix,
-        "series_repo": f"{repo_prefix}_Series",
-        "events_current_base": f"{repo_prefix}_Events_Current",
-        "markets_current_base": f"{repo_prefix}_Markets_Current",
-        "events_year_base": f"{repo_prefix}_Events",
-        "markets_year_base": f"{repo_prefix}_Markets",
+def gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {GH_PAT}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": UA,
     }
 
-    tracker = RepoRolloverTracker(repo_prefix, state)
-    wm = WriterManager(owner, tracker)
+def gh_repo_exists(owner: str, repo: str) -> bool:
+    r = requests.get(f"{GH_API}/repos/{owner}/{repo}", headers=gh_headers(), timeout=30)
+    return r.status_code == 200
 
-    def yield_item(rel, obj):
-        # rel may be Path
-        rel_str = str(rel).lstrip("/")
-        repo, kind, scope = target_repo_for_relpath(rel_str, tracker, targets)
-        w = wm.get(repo)
-        nbytes = w.write_json(rel_str, obj) or 0
-        tracker.record_bytes(kind, scope, nbytes)
-        w.maybe_flush(force=False)
+def gh_create_repo(owner: str, repo: str, description: str = "") -> None:
+    """
+    Create repo under authenticated user account. If owner != authenticated user, this may fail.
+    We treat 422 as non-fatal (repo may already exist or name conflict).
+    """
+    payload = {"name": repo, "description": description, "private": False, "has_issues": False, "has_projects": False, "has_wiki": False}
+    r = requests.post(f"{GH_API}/user/repos", headers=gh_headers(), json=payload, timeout=60)
+    if r.status_code in (201,):
+        log.info("Created repo: %s/%s", owner, repo)
+        return
+    if r.status_code == 422:
+        # Often means \"name already exists\" (or invalid). We'll proceed and let clone decide.
+        log.warning("GitHub repo create returned 422 for %s/%s: %s", owner, repo, r.text[:200])
+        return
+    raise RuntimeError(f"GitHub: repo create failed {owner}/{repo}: {r.status_code} {r.text[:500]}")
 
-    first_run = not bool(state.get("first_full_done"))
-    log.info("Kalshi fan-out crawler | owner=%s", owner)
+def ensure_repo(owner: str, repo: str, description: str = "") -> None:
+    if gh_repo_exists(owner, repo):
+        return
+    log.info("Creating missing repo: %s/%s", owner, repo)
+    gh_create_repo(owner, repo, description)
+
+# -----------------------------
+# Git / Repo writer
+# -----------------------------
+
+def run(cmd: List[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+    if VERBOSE_GIT or cmd[0] != "git":
+        log.debug("$ %s", " ".join(cmd))
+    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        tail = (p.stderr or "")[-500:]
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
+    return p
+
+def remove_stale_git_locks(repo_path: Path) -> None:
+    lock = repo_path / ".git" / "index.lock"
+    if lock.exists():
+        try:
+            lock.unlink()
+        except Exception:
+            pass
+
+def git_setup_identity(repo_path: Path) -> None:
+    # set per-repo identity to avoid failure
+    run(["git", "config", "user.email", "actions@github.com"], cwd=repo_path, check=False)
+    run(["git", "config", "user.name", "github-actions"], cwd=repo_path, check=False)
+
+def git_clone_or_init(owner: str, repo: str, local_path: Path) -> None:
+    url = f"https://github.com/{owner}/{repo}.git"
+    if local_path.exists():
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    # shallow clone to keep disk low
+    run(["git", "clone", "--depth", "1", url, str(local_path)], check=True)
+    git_setup_identity(local_path)
+
+def git_has_changes(repo_path: Path) -> bool:
+    remove_stale_git_locks(repo_path)
+    p = run(["git", "status", "--porcelain"], cwd=repo_path, check=True)
+    return bool(p.stdout.strip())
+
+def git_commit_push_if_changed(repo_path: Path, msg: str) -> bool:
+    remove_stale_git_locks(repo_path)
+    if not git_has_changes(repo_path):
+        return False
+    run(["git", "add", "-A"], cwd=repo_path, check=True)
+    # commit may fail if nothing staged (race)
+    p = run(["git", "commit", "--quiet", "-m", msg], cwd=repo_path, check=False)
+    if p.returncode != 0:
+        # re-check if changes vanished
+        if not git_has_changes(repo_path):
+            return False
+        raise subprocess.CalledProcessError(p.returncode, ["git", "commit"], output=p.stdout, stderr=p.stderr)
+    # push
+    run(["git", "push", "--quiet"], cwd=repo_path, check=True)
+    return True
+
+@dataclass
+class RepoCounts:
+    updated_utc: str = ""
+    total_files: int = 0
+    json_files: int = 0
+    series_json: int = 0
+    event_json: int = 0
+    market_json: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "updated_utc": self.updated_utc,
+            "total_files": self.total_files,
+            "json_files": self.json_files,
+            "series_json": self.series_json,
+            "event_json": self.event_json,
+            "market_json": self.market_json,
+        }
+
+@dataclass
+class RepoWriter:
+    owner: str
+    repo: str
+    description: str
+    local_path: Path
+    commit_every_files: int
+    counts: RepoCounts = field(default_factory=RepoCounts)
+    _since_commit: int = 0
+    _last_used_ts: float = field(default_factory=lambda: time.time())
+
+    def touch(self) -> None:
+        self._last_used_ts = time.time()
+
+    def ensure_open(self) -> None:
+        ensure_repo(self.owner, self.repo, self.description)
+        git_clone_or_init(self.owner, self.repo, self.local_path)
+        self.touch()
+
+    def write_json(self, relpath: str, obj: Dict[str, Any], kind: str) -> None:
+        self.ensure_open()
+        relpath = normalize_rel(relpath)
+        out = self.local_path / relpath
+        json_dump(out, obj)
+        self._since_commit += 1
+        # update counts
+        self.counts.total_files += 1
+        self.counts.json_files += 1
+        if kind == "series":
+            self.counts.series_json += 1
+        elif kind == "event":
+            self.counts.event_json += 1
+        elif kind == "market":
+            self.counts.market_json += 1
+
+    def maybe_flush(self, force: bool = False) -> None:
+        self.touch()
+        # update counts file every flush, so stats generator can read it remotely
+        if force or self._since_commit >= self.commit_every_files:
+            self.flush()
+
+    def flush(self) -> None:
+        self.ensure_open()
+        self.counts.updated_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        counts_path = self.local_path / "KALSHI_COUNTS.json"
+        json_dump(counts_path, self.counts.to_dict())
+        msg = f"kalshi: update data ({NOW_UTC.strftime('%Y-%m-%d %H:%M UTC')})"
+        git_commit_push_if_changed(self.local_path, msg)
+        self._since_commit = 0
+
+    def close_and_delete(self) -> None:
+        # best-effort flush then delete local repo dir
+        try:
+            self.flush()
+        except Exception as e:
+            log.warning("flush failed on close for %s: %s", self.repo, e)
+        try:
+            if self.local_path.exists():
+                shutil.rmtree(self.local_path, ignore_errors=True)
+        except Exception:
+            pass
+
+class WriterManager:
+    def __init__(self, owner: str, commit_every_files: int, max_open_repos: int):
+        self.owner = owner
+        self.commit_every_files = commit_every_files
+        self.max_open_repos = max_open_repos
+        self._writers: Dict[str, RepoWriter] = {}
+
+    def get(self, repo: str, description: str) -> RepoWriter:
+        w = self._writers.get(repo)
+        if w is None:
+            local_path = WORK_REPOS_DIR / repo
+            w = RepoWriter(self.owner, repo, description, local_path, self.commit_every_files)
+            self._writers[repo] = w
+        w.touch()
+        self._enforce_open_limit()
+        return w
+
+    def _enforce_open_limit(self) -> None:
+        # We keep writer objects, but we want to keep at most N local clones on disk.
+        # Close (flush + delete) least recently used clones if too many exist.
+        open_local = [(r, w) for r, w in self._writers.items() if w.local_path.exists()]
+        if len(open_local) <= self.max_open_repos:
+            return
+        open_local.sort(key=lambda rw: rw[1]._last_used_ts)
+        while len(open_local) > self.max_open_repos:
+            repo, w = open_local.pop(0)
+            log.info("Closing repo to save disk (LRU): %s", repo)
+            w.close_and_delete()
+
+    def flush_all(self) -> None:
+        for w in list(self._writers.values()):
+            try:
+                w.flush()
+            except Exception as e:
+                log.warning("flush_all failed for %s: %s", w.repo, e)
+
+    def close_all(self) -> None:
+        for w in list(self._writers.values()):
+            w.close_and_delete()
+
+# -----------------------------
+# Rollover tracker
+# -----------------------------
+
+class RepoRolloverTracker:
+    """
+    Tracks current index (NNN) for each repo prefix (e.g. Statground_Data_Kalshi_Events_2026).
+    The index increments when:
+      - disk is low OR
+      - repo local size exceeds REPO_MAX_BYTES
+    """
+
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+        self.state.setdefault("rollover", {})  # prefix -> index int
+
+    def current_index(self, prefix: str) -> int:
+        return int(self.state["rollover"].get(prefix, 1))
+
+    def bump(self, prefix: str) -> int:
+        cur = self.current_index(prefix)
+        nxt = cur + 1
+        self.state["rollover"][prefix] = nxt
+        return nxt
+
+    def repo_name(self, prefix: str) -> str:
+        idx = self.current_index(prefix)
+        return f"{prefix}_{idx:0{ROLLOVER_SUFFIX_WIDTH}d}"
+
+# -----------------------------
+# API crawling
+# -----------------------------
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA})
+
+def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = BASE_URL.rstrip("/") + path
+    r = SESSION.get(url, params=params or {}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def paginate(path: str, list_key: str, params: Optional[Dict[str, Any]] = None, cursor_key: str = "cursor") -> Iterable[Dict[str, Any]]:
+    """
+    Generic cursor pagination.
+    Kalshi trade-api/v2 typically returns:
+      { <list_key>: [...], cursor: \"...\" }  OR { <list_key>: [...], next_cursor: \"...\" }
+    """
+    cursor = None
+    p = dict(params or {})
+    while True:
+        if cursor:
+            p[cursor_key] = cursor
+        data = api_get(path, p)
+        items = data.get(list_key, []) or []
+        for it in items:
+            yield it
+        cursor = data.get("cursor") or data.get("next_cursor")
+        if not cursor:
+            break
+
+def shard_prefix(s: str) -> str:
+    # shard by first two hex chars of sha1 for directory fanout
+    return sha1_short(s)[:2]
+
+def series_relpath(o: Dict[str, Any]) -> str:
+    sid = str(o.get("ticker") or o.get("id") or sha1_short(json.dumps(o, sort_keys=True)))
+    sp = shard_prefix(sid)
+    return f"series/{sp}/{sid}.json"
+
+def event_relpath(o: Dict[str, Any]) -> str:
+    status = "closed" if (o.get("closed") or o.get("status") == "closed") else "open"
+    y, m = yyyymm_from_obj(o)
+    eid = str(o.get("ticker") or o.get("id") or sha1_short(json.dumps(o, sort_keys=True)))
+    sp = shard_prefix(eid)
+    return f"events/{status}/{y}/{m}/{sp}/{eid}.json"
+
+def market_relpath(o: Dict[str, Any]) -> str:
+    status = "closed" if (o.get("closed") or o.get("status") == "closed") else "open"
+    y, m = yyyymm_from_obj(o)
+    mid = str(o.get("ticker") or o.get("id") or sha1_short(json.dumps(o, sort_keys=True)))
+    sp = shard_prefix(mid)
+    return f"markets/{status}/{y}/{m}/{sp}/{mid}.json"
+
+def year_from_relpath(rel: str) -> Optional[str]:
+    parts = normalize_rel(rel).split("/")
+    # events/<status>/<year>/...
+    if len(parts) >= 3 and parts[0] in ("events", "markets"):
+        y = parts[2]
+        if y.isdigit() and len(y) == 4:
+            return y
+    return None
+
+# -----------------------------
+# State
+# -----------------------------
+
+def load_state() -> Dict[str, Any]:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_state(state: Dict[str, Any]) -> None:
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+# -----------------------------
+# Target repo selection + disk-based rollover
+# -----------------------------
+
+def should_roll_repo(local_repo_path: Path) -> bool:
+    # roll if disk is low, or repo dir is too big
+    free = disk_free_bytes(Path("."))
+    if free < DISK_FREE_MIN_BYTES:
+        return True
+    # check repo size (best-effort with early stop)
+    size = dir_size_bytes(local_repo_path, stop_at=REPO_MAX_BYTES + 1)
+    return size > REPO_MAX_BYTES
+
+def pick_repo_for(rel: str, kind: str, tracker: RepoRolloverTracker, wm: WriterManager) -> str:
+    """
+    Decide which GitHub repo to write to for a given relpath and kind.
+    Applies year split + numbered suffix rollover.
+    """
+    rel = normalize_rel(rel)
+    if kind == "series":
+        return "Statground_Data_Kalshi_Series"
+
+    y = year_from_relpath(rel)
+    if kind == "event":
+        base = "Statground_Data_Kalshi_Events"
+    elif kind == "market":
+        base = "Statground_Data_Kalshi_Markets"
+    else:
+        base = "Statground_Data_Kalshi_Unknown"
+
+    prefix = f"{base}_{y}" if y else f"{base}_Current"
+    repo = tracker.repo_name(prefix)
+
+    # Ensure writer exists so we can check local path size if present
+    w = wm.get(repo, f"Statground Kalshi {kind} data ({y or 'Current'})")
+    # Open repo (clone) only when we actually write; but rollover wants local path
+    if w.local_path.exists() and should_roll_repo(w.local_path):
+        # close + delete to free disk, then bump index
+        log.info("Rollover triggered for %s (disk low or repo too big).", repo)
+        w.close_and_delete()
+        tracker.bump(prefix)
+        repo = tracker.repo_name(prefix)
+
+    return repo
+
+# -----------------------------
+# Main crawl
+# -----------------------------
+
+def main() -> None:
+    state = load_state()
+    state.setdefault("cursors", {})
+    tracker = RepoRolloverTracker(state)
+    wm = WriterManager(OWNER, COMMIT_EVERY_FILES, MAX_OPEN_REPOS)
+
+    log.info("Kalshi fan-out crawler | owner=%s", OWNER)
     log.info("base_url=%s", BASE_URL)
     log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
-    log.info("logfile=%s", LOG_FILE)
-    log.info("mode=%s", "FULL(first run)" if first_run else "FULL(resume/refresh)")
+    log.info("logfile=%s", str(LOG_FILE))
+
+    mode = "FULL(first run)" if not state.get("completed_full") else "INCR"
+    log.info("mode=%s", mode)
+
+    n_series = n_events = n_markets = 0
 
     try:
-        n_series = crawl_series_all(yield_item)
+        # ---- SERIES ----
+        for o in paginate("/series", "series"):
+            rel = series_relpath(o)
+            repo = pick_repo_for(rel, "series", tracker, wm)
+            w = wm.get(repo, "Statground Kalshi series data")
+            w.write_json(rel, o, "series")
+            w.maybe_flush(False)
+            n_series += 1
+            if n_series % 5000 == 0:
+                log.info("series progress: %s", f"{n_series:,}")
+                save_state(state)
+
         log.info("series done: %s", f"{n_series:,}")
 
-        n_events = crawl_events_full(yield_item, state)
-        log.info("events(full) done: %s", f"{n_events:,}")
+        # ---- EVENTS ----
+        for o in paginate("/events", "events"):
+            rel = event_relpath(o)
+            repo = pick_repo_for(rel, "event", tracker, wm)
+            w = wm.get(repo, "Statground Kalshi events data")
+            w.write_json(rel, o, "event")
+            w.maybe_flush(False)
+            n_events += 1
+            if n_events % 50000 == 0:
+                log.info("events progress: %s", f"{n_events:,}")
+                save_state(state)
 
-        n_markets = crawl_markets_full(yield_item, state)
-        log.info("markets(full) done: %s", f"{n_markets:,}")
+        log.info("events done: %s", f"{n_events:,}")
 
-        state["first_full_done"] = True
+        # ---- MARKETS ----
+        for o in paginate("/markets", "markets"):
+            rel = market_relpath(o)
+            repo = pick_repo_for(rel, "market", tracker, wm)
+            w = wm.get(repo, "Statground Kalshi markets data")
+            w.write_json(rel, o, "market")
+            w.maybe_flush(False)
+            n_markets += 1
+            if n_markets % 50000 == 0:
+                log.info("markets progress: %s", f"{n_markets:,}")
+                save_state(state)
+
+        log.info("markets done: %s", f"{n_markets:,}")
+
+        # final flush
+        wm.flush_all()
+        state["completed_full"] = True
         save_state(state)
 
-    finally:
-        # Ensure all writers flush/close and local repos are removed to protect runner disk
+    except Exception as e:
+        log.error("FATAL: %s", e, exc_info=True)
+        # attempt to flush what we can
         try:
-            wm.close_all()
+            wm.flush_all()
         except Exception:
-            log.exception("wm.close_all failed")
+            pass
+        save_state(state)
+        raise
+    finally:
+        # Always close and delete local repos to reclaim disk (important for next steps).
+        wm.close_all()
+
+    log.info("DONE. series=%s events=%s markets=%s", f"{n_series:,}", f"{n_events:,}", f"{n_markets:,}")
 
 
 if __name__ == "__main__":
-
-    try:
-        main()
-    except Exception as e:
-        if isinstance(e, subprocess.CalledProcessError):
-            print("\n========== FAILED COMMAND ==========")
-            try:
-                print("CMD:", " ".join(e.cmd) if isinstance(e.cmd, (list, tuple)) else str(e.cmd))
-            except Exception:
-                pass
-            if e.stderr:
-                print("\n--- stderr (tail) ---")
-                print((e.stderr or "")[-4000:])
-            if e.output:
-                print("\n--- stdout (tail) ---")
-                out = e.output if isinstance(e.output, str) else str(e.output)
-                print(out[-2000:])
-            print("===================================\n")
-        log.exception("FATAL: %s", e)
-        print("\n========== LOG TAIL (last lines) ==========")
-        print(tail_file(LOG_FILE, LOG_TAIL_ON_ERROR))
-        print("==========================================\n")
-        raise
+    main()
