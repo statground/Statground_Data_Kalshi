@@ -26,7 +26,11 @@ jobs:
       KALSHI_MARKET_BACKFILL_SEC: "120"
 
       # Resume-friendly safety budget under GitHub 6h job limit
+<<<<<<< HEAD
       TIME_BUDGET_SECONDS: "19800"   # upper bound; script caps to next schedule - 15min   # 5.5h
+=======
+      TIME_BUDGET_SECONDS: "21600"   # upper bound; script caps to next schedule - 15min   # 5.5h
+>>>>>>> origin/main
 
       # Pull as much as possible per request
       KALSHI_LIMIT_EVENTS: "200"

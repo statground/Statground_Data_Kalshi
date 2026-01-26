@@ -772,6 +772,7 @@ def _next_scheduled_kst(now_utc: dt.datetime) -> dt.datetime:
         if cand > now_kst:
             return cand
     return (base + dt.timedelta(days=1)).replace(hour=0)
+<<<<<<< HEAD
 
 def _effective_budget_seconds() -> int:
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -784,6 +785,40 @@ def _effective_budget_seconds() -> int:
     eff = min(time_budget_s, cap) if time_budget_s > 0 else cap
     # Always allow at least 60 seconds so we can flush state/logs.
     return max(60, eff)
+=======
+
+def _effective_budget_seconds() -> int:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    next_run_kst = _next_scheduled_kst(now_utc)
+    finish_by_kst = next_run_kst - dt.timedelta(minutes=15)
+    finish_by_utc = finish_by_kst.astimezone(dt.timezone.utc)
+    cap = int((finish_by_utc - now_utc).total_seconds())
+    if cap < 0:
+        cap = 0
+    eff = min(time_budget_s, cap) if time_budget_s > 0 else cap
+    # Always allow at least 60 seconds so we can flush state/logs.
+    return max(60, eff)
+
+eff_budget_s = _effective_budget_seconds()
+started_mon = time.monotonic()
+deadline_mon = started_mon + eff_budget_s
+
+def time_left_s() -> int:
+    return int(deadline_mon - time.monotonic())
+
+# Keep a small buffer for final flush/push.
+FINAL_FLUSH_BUFFER_S = int(os.environ.get("FINAL_FLUSH_BUFFER_SECONDS", "120"))
+
+def should_stop() -> bool:
+    return time_left_s() <= FINAL_FLUSH_BUFFER_S
+
+    log.info("Kalshi fan-out crawler | owner=%s", OWNER)
+    log.info("base_url=%s", BASE_URL)
+    log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
+    log.info("time_budget_seconds=%s", time_budget_s)
+    log.info("effective_time_budget_seconds=%s final_flush_buffer_seconds=%s", eff_budget_s, FINAL_FLUSH_BUFFER_S)
+    log.info("logfile=%s", str(LOG_FILE))
+>>>>>>> origin/main
 
 eff_budget_s = _effective_budget_seconds()
 started_mon = time.monotonic()
