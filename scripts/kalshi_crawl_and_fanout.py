@@ -743,36 +743,79 @@ def main() -> None:
     wm = WriterManager(OWNER, COMMIT_EVERY_FILES, MAX_OPEN_REPOS)
     repos_seen: set[str] = set()
 
-    # Time budget: exit gracefully before GH Actions hard limit (often 6h).
-    # Default: 5h30m so we can flush/push state safely.
-    time_budget_s = int(os.environ.get("TIME_BUDGET_SECONDS", str(5 * 3600 + 30 * 60)))
-    started_mon = time.monotonic()
-    deadline_mon = started_mon + max(60, time_budget_s)
+    # Time budget: exit gracefully before GH Actions hard limit (often 6h),
+# AND (important) finish at least 15 minutes before the next scheduled run
+# (KST 00:00/06:00/12:00/18:00) so schedules don't get blocked by a manual run.
+#
+# TIME_BUDGET_SECONDS is still supported as an upper bound, but the effective budget
+# is capped by "next scheduled run - 15 minutes".
+time_budget_s = int(os.environ.get("TIME_BUDGET_SECONDS", str(5 * 3600 + 45 * 60)))  # default 5h45m
 
-    def time_left_s() -> int:
-        return int(deadline_mon - time.monotonic())
+# ---- Schedule-aware cap (Asia/Seoul) ----
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+    _KST = ZoneInfo("Asia/Seoul")
+except Exception:
+    _KST = None
 
-    def should_stop() -> bool:
-        # Keep a small buffer for final flush/push.
-        return time_left_s() <= 10 * 60
+def _next_scheduled_kst(now_utc: dt.datetime) -> dt.datetime:
+    # Schedule: every day at 00:00/06:00/12:00/18:00 KST
+    if _KST is None:
+        # Fallback: assume KST=UTC+9 fixed offset
+        kst = dt.timezone(dt.timedelta(hours=9))
+    else:
+        kst = _KST
+    now_kst = now_utc.astimezone(kst)
+    base = now_kst.replace(minute=0, second=0, microsecond=0)
+    for h in (0, 6, 12, 18):
+        cand = base.replace(hour=h)
+        if cand > now_kst:
+            return cand
+    return (base + dt.timedelta(days=1)).replace(hour=0)
 
-    log.info("Kalshi fan-out crawler | owner=%s", OWNER)
-    log.info("base_url=%s", BASE_URL)
-    log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
-    log.info("time_budget_seconds=%s", time_budget_s)
-    log.info("logfile=%s", str(LOG_FILE))
+def _effective_budget_seconds() -> int:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    next_run_kst = _next_scheduled_kst(now_utc)
+    finish_by_kst = next_run_kst - dt.timedelta(minutes=15)
+    finish_by_utc = finish_by_kst.astimezone(dt.timezone.utc)
+    cap = int((finish_by_utc - now_utc).total_seconds())
+    if cap < 0:
+        cap = 0
+    eff = min(time_budget_s, cap) if time_budget_s > 0 else cap
+    # Always allow at least 60 seconds so we can flush state/logs.
+    return max(60, eff)
 
-    mode = "FULL(first run)" if not state.get("completed_full") else "INCR"
-    log.info("mode=%s", mode)
+eff_budget_s = _effective_budget_seconds()
+started_mon = time.monotonic()
+deadline_mon = started_mon + eff_budget_s
 
-    n_series = n_events = n_markets = 0
+def time_left_s() -> int:
+    return int(deadline_mon - time.monotonic())
 
-    # Use max supported page sizes (reduces API calls).
-    # /events limit max 200
-    # /markets limit max 1000
-    limit_events = int(os.environ.get("KALSHI_LIMIT_EVENTS", "200"))
-    limit_markets = int(os.environ.get("KALSHI_LIMIT_MARKETS", "1000"))
-    limit_series = int(os.environ.get("KALSHI_LIMIT_SERIES", "1000"))
+# Keep a small buffer for final flush/push.
+FINAL_FLUSH_BUFFER_S = int(os.environ.get("FINAL_FLUSH_BUFFER_SECONDS", "120"))
+
+def should_stop() -> bool:
+    return time_left_s() <= FINAL_FLUSH_BUFFER_S
+
+log.info("Kalshi fan-out crawler | owner=%s", OWNER)
+log.info("base_url=%s", BASE_URL)
+log.info("commit_every_files=%s max_open_repos=%s verbose_git=%s", COMMIT_EVERY_FILES, MAX_OPEN_REPOS, VERBOSE_GIT)
+log.info("time_budget_seconds=%s", time_budget_s)
+log.info("effective_time_budget_seconds=%s final_flush_buffer_seconds=%s", eff_budget_s, FINAL_FLUSH_BUFFER_S)
+log.info("logfile=%s", str(LOG_FILE))
+
+mode = "FULL(first run)" if not state.get("completed_full") else "INCR"
+log.info("mode=%s", mode)
+
+n_series = n_events = n_markets = 0
+
+# Use max supported page sizes (reduces API calls).
+# /events limit max 200
+# /markets limit max 1000
+limit_events = int(os.environ.get("KALSHI_LIMIT_EVENTS", "200"))
+limit_markets = int(os.environ.get("KALSHI_LIMIT_MARKETS", "1000"))
+limit_series = int(os.environ.get("KALSHI_LIMIT_SERIES", "1000"))
 
     def graceful_stop(reason: str) -> None:
         log.warning("Stopping early (%s). Flushing and saving state for next run... (time_left=%ss)", reason, time_left_s())

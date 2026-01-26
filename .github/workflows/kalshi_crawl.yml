@@ -3,8 +3,8 @@ name: Kalshi Crawl + Fan-out (auto-create repos)
 on:
   workflow_dispatch:
   schedule:
-    # Every 8 hours (UTC). Use minute 17 to avoid top-of-hour congestion.
-    - cron: "17 */8 * * *"
+    # Run at KST 00:00/06:00/12:00/18:00 (UTC 15:00/21:00/03:00/09:00).
+    - cron: "0 15,21,3,9 * * *"
 
 concurrency:
   group: kalshi-crawl-fanout
@@ -26,7 +26,7 @@ jobs:
       KALSHI_MARKET_BACKFILL_SEC: "120"
 
       # Resume-friendly safety budget under GitHub 6h job limit
-      TIME_BUDGET_SECONDS: "19800"   # 5.5h
+      TIME_BUDGET_SECONDS: "19800"   # upper bound; script caps to next schedule - 15min   # 5.5h
 
       # Pull as much as possible per request
       KALSHI_LIMIT_EVENTS: "200"
