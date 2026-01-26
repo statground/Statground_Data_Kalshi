@@ -44,6 +44,42 @@ import hashlib
 import logging
 import subprocess
 import datetime as dt
+
+# -------------------------
+# Schedule-aware time budget (KST 00/06/12/18 by default)
+# -------------------------
+def _parse_int_list(csv: str, default: list[int]) -> list[int]:
+    try:
+        out = [int(x.strip()) for x in (csv or "").split(",") if x.strip() != ""]
+        return out or default
+    except Exception:
+        return default
+
+def _next_kst_schedule_dt(now_utc: dt.datetime, kst_hours: list[int]) -> dt.datetime:
+    """Return next scheduled datetime in Asia/Seoul, converted to UTC."""
+    from zoneinfo import ZoneInfo
+    kst = ZoneInfo("Asia/Seoul")
+    now_kst = now_utc.astimezone(kst)
+    hours_sorted = sorted(set(kst_hours))
+    # candidate times today
+    for h in hours_sorted:
+        cand = now_kst.replace(hour=h, minute=0, second=0, microsecond=0)
+        if cand > now_kst:
+            return cand.astimezone(dt.timezone.utc)
+    # otherwise first slot tomorrow
+    tomorrow = (now_kst + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    cand = tomorrow.replace(hour=hours_sorted[0], minute=0, second=0, microsecond=0)
+    return cand.astimezone(dt.timezone.utc)
+
+def _compute_effective_deadline(start_utc: dt.datetime, base_budget_sec: int, finish_before_min: int, kst_hours: list[int]) -> float:
+    """Return epoch seconds when we should stop (min of base budget and next schedule minus buffer)."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    next_sched_utc = _next_kst_schedule_dt(now_utc, kst_hours)
+    buffer_sec = max(0, int(finish_before_min) * 60)
+    finish_by_utc = next_sched_utc - dt.timedelta(seconds=buffer_sec)
+    base_deadline = start_utc + dt.timedelta(seconds=base_budget_sec)
+    effective = min(base_deadline, finish_by_utc)
+    return effective.timestamp()
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
