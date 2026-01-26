@@ -623,13 +623,29 @@ def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     r.raise_for_status()
     return r.json()
 
-def paginate(path: str, list_key: str, params: Optional[Dict[str, Any]] = None, cursor_key: str = "cursor") -> Iterable[Dict[str, Any]]:
+def paginate(
+    path: str,
+    list_key: str,
+    params: Optional[Dict[str, Any]] = None,
+    cursor_key: str = "cursor",
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    state_name: Optional[str] = None,
+    stop_fn=None,
+) -> Iterable[Dict[str, Any]]:
     """
-    Generic cursor pagination.
-    Kalshi trade-api/v2 typically returns:
-      { <list_key>: [...], cursor: \"...\" }  OR { <list_key>: [...], next_cursor: \"...\" }
+    Generic cursor pagination with optional resume + graceful stop.
+
+    If `state` and `state_name` are provided, cursor will be persisted in:
+      state.setdefault("cursors", {})[state_name] = <next_cursor>
+
+    If `stop_fn` is provided and returns True, pagination stops after
+    persisting the next cursor (so the next run can resume).
     """
     cursor = None
+    if state is not None and state_name:
+        cursor = (state.get("cursors") or {}).get(state_name)
+
     p = dict(params or {})
     while True:
         if cursor:
@@ -638,9 +654,18 @@ def paginate(path: str, list_key: str, params: Optional[Dict[str, Any]] = None, 
         items = data.get(list_key, []) or []
         for it in items:
             yield it
-        cursor = data.get("cursor") or data.get("next_cursor")
+
+        next_cursor = data.get("cursor") or data.get("next_cursor")
+        if state is not None and state_name:
+            state.setdefault("cursors", {})[state_name] = next_cursor
+
+        cursor = next_cursor
+
+        if stop_fn is not None and stop_fn():
+            break
         if not cursor:
             break
+
 
 def shard_prefix(s: str) -> str:
     # shard by first two hex chars of sha1 for directory fanout
@@ -743,6 +768,21 @@ def pick_repo_for(rel: str, kind: str, tracker: RepoRolloverTracker, wm: WriterM
 def main() -> None:
     state = load_state()
     state.setdefault("cursors", {})
+
+    # ---- time budget / graceful stop ----
+    start_utc = dt.datetime.now(dt.timezone.utc)
+    time_budget_seconds = int(os.getenv("TIME_BUDGET_SECONDS", "19800"))  # default 5.5h
+    finish_before_min = int(os.getenv("FINISH_BEFORE_NEXT_SCHEDULE_MINUTES", "15"))
+    kst_hours = _parse_int_list(os.getenv("SCHEDULE_KST_HOURS", "0,6,12,18"), [0, 6, 12, 18])
+    effective_deadline_ts = _compute_effective_deadline(start_utc, time_budget_seconds, finish_before_min, kst_hours)
+    log.info("time_budget_seconds=%s", time_budget_seconds)
+    log.info("finish_before_next_schedule_minutes=%s kst_hours=%s", finish_before_min, ",".join(map(str, kst_hours)))
+    log.info("effective_deadline_utc=%s", dt.datetime.fromtimestamp(effective_deadline_ts, tz=dt.timezone.utc).isoformat())
+
+    def should_stop() -> bool:
+        # Stop when reaching effective deadline (min of base budget and next schedule minus buffer).
+        return time.time() >= effective_deadline_ts
+
     tracker = RepoRolloverTracker(state)
     wm = WriterManager(OWNER, COMMIT_EVERY_FILES, MAX_OPEN_REPOS)
     repos_seen: set[str] = set()
@@ -759,7 +799,7 @@ def main() -> None:
 
     try:
         # ---- SERIES ----
-        for o in paginate("/series", "series"):
+        for o in paginate("/series", "series", state=state, state_name="series", stop_fn=should_stop):
             rel = series_relpath(o)
             repo = pick_repo_for(rel, "series", tracker, wm)
             repos_seen.add(repo)
@@ -767,6 +807,12 @@ def main() -> None:
             w.write_json(rel, o, "series")
             w.maybe_flush(False)
             n_series += 1
+
+            if should_stop():
+                log.info("STOP: reached effective deadline; flushing state and closing repos.")
+                save_state(state)
+                wm.close_all()
+                return
             if n_series % 5000 == 0:
                 log.info("series progress: %s", f"{n_series:,}")
                 save_state(state)
@@ -774,7 +820,7 @@ def main() -> None:
         log.info("series done: %s", f"{n_series:,}")
 
         # ---- EVENTS ----
-        for o in paginate("/events", "events"):
+        for o in paginate("/events", "events", state=state, state_name="events", stop_fn=should_stop):
             rel = event_relpath(o)
             repo = pick_repo_for(rel, "event", tracker, wm)
             repos_seen.add(repo)
@@ -782,6 +828,12 @@ def main() -> None:
             w.write_json(rel, o, "event")
             w.maybe_flush(False)
             n_events += 1
+
+            if should_stop():
+                log.info("STOP: reached effective deadline; flushing state and closing repos.")
+                save_state(state)
+                wm.close_all()
+                return
             if n_events % 50000 == 0:
                 log.info("events progress: %s", f"{n_events:,}")
                 save_state(state)
@@ -789,7 +841,7 @@ def main() -> None:
         log.info("events done: %s", f"{n_events:,}")
 
         # ---- MARKETS ----
-        for o in paginate("/markets", "markets"):
+        for o in paginate("/markets", "markets", state=state, state_name="markets", stop_fn=should_stop):
             rel = market_relpath(o)
             repo = pick_repo_for(rel, "market", tracker, wm)
             repos_seen.add(repo)
@@ -797,6 +849,12 @@ def main() -> None:
             w.write_json(rel, o, "market")
             w.maybe_flush(False)
             n_markets += 1
+
+            if should_stop():
+                log.info("STOP: reached effective deadline; flushing state and closing repos.")
+                save_state(state)
+                wm.close_all()
+                return
             if n_markets % 50000 == 0:
                 log.info("markets progress: %s", f"{n_markets:,}")
                 save_state(state)
