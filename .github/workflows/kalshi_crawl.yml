@@ -3,8 +3,8 @@ name: Kalshi Crawl + Fan-out (auto-create repos)
 on:
   workflow_dispatch:
   schedule:
-    # Every 6 hours (UTC). Adjust as needed.
-    - cron: "0 */8 * * *"
+    # Every 8 hours (UTC). Use minute 17 to avoid top-of-hour congestion.
+    - cron: "17 */8 * * *"
 
 concurrency:
   group: kalshi-crawl-fanout
@@ -16,6 +16,25 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      KALSHI_BASE_URL: "https://api.elections.kalshi.com/trade-api/v2"
+      KALSHI_SLEEP_SEC: "0.05"
+      KALSHI_LOG_EVERY: "50"
+      KALSHI_EVENT_BACKFILL_SEC: "172800"
+      KALSHI_MARKET_BACKFILL_SEC: "120"
+
+      # Resume-friendly safety budget under GitHub 6h job limit
+      TIME_BUDGET_SECONDS: "19800"   # 5.5h
+
+      # Pull as much as possible per request
+      KALSHI_LIMIT_EVENTS: "200"
+      KALSHI_LIMIT_MARKETS: "1000"
+
+      GIT_AUTHOR_NAME: "github-actions[bot]"
+      GIT_AUTHOR_EMAIL: "github-actions[bot]@users.noreply.github.com"
+
     steps:
       - name: Checkout orchestrator repo
         uses: actions/checkout@v4
@@ -33,18 +52,6 @@ jobs:
           pip install requests
 
       - name: Crawl + fan-out push (auto-create repos)
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          KALSHI_BASE_URL: "https://api.elections.kalshi.com/trade-api/v2"
-          KALSHI_SLEEP_SEC: "0.05"
-          KALSHI_LOG_EVERY: "50"
-          KALSHI_EVENT_BACKFILL_SEC: "172800"
-          KALSHI_MARKET_BACKFILL_SEC: "120"
-          TIME_BUDGET_SECONDS: "19800"   # 5.5h safety budget under 6h GH limit
-          KALSHI_LIMIT_EVENTS: "200"
-          KALSHI_LIMIT_MARKETS: "1000"
-          GIT_AUTHOR_NAME: "github-actions[bot]"
-          GIT_AUTHOR_EMAIL: "github-actions[bot]@users.noreply.github.com"
         run: |
           python scripts/kalshi_crawl_and_fanout.py
 
@@ -54,8 +61,8 @@ jobs:
             echo "No orchestrator changes."
             exit 0
           fi
-          git config user.name "${GIT_AUTHOR_NAME:-github-actions[bot]}"
-          git config user.email "${GIT_AUTHOR_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
           git add -A
           git commit -m "kalshi: update state/targets (auto)"
           git push
