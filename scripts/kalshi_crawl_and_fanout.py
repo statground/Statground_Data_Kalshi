@@ -25,7 +25,7 @@ WORK_DIR = Path(".work")
 WORK_REPOS_DIR = WORK_DIR / "repos"
 
 COMMIT_EVERY_FILES = int(os.environ.get("COMMIT_EVERY_FILES", "5000"))
-FINISH_BUFFER_SEC = 15 * 60 # 15분 안전 버퍼
+FINISH_BUFFER_SEC = 15 * 60 
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
@@ -43,16 +43,12 @@ def sync_orchestrator(msg):
 
 def should_stop():
     now = dt.datetime.now(dt.timezone.utc)
-    sched_utc = [15, 21, 3, 9] # KST 0, 6, 12, 18시 기준 UTC
+    sched_utc = [15, 21, 3, 9] 
     next_h = min([h for h in sched_utc if h > now.hour] or [min(sched_utc)])
     target = now.replace(hour=next_h, minute=0, second=0, microsecond=0)
     if next_h <= now.hour: target += dt.timedelta(days=1)
-    
     rem_sec = (target - now).total_seconds()
-    if rem_sec < FINISH_BUFFER_SEC:
-        print(f"\n[Safety Stop] Next schedule in {rem_sec/60:.1f} min. Syncing and exiting...", flush=True)
-        return True
-    return False
+    return rem_sec < FINISH_BUFFER_SEC or (time.time() - START_TIME) > 19800
 
 def get_path_info(kind, obj):
     ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
@@ -121,12 +117,22 @@ def main():
                     checkpoint(f"kalshi: {kind} safety stop")
                     return
 
-                resp = requests.get(BASE_URL + endpoint, params={"cursor": cursor} if cursor else {}, timeout=60)
-                if resp.status_code != 200:
-                    print(f"\n[Error] API {resp.status_code} on {kind}", flush=True)
-                    break
+                # API 호출 (429 에러 지수 백오프 적용)
+                data = None
+                for i in range(5): # 최대 5회 재시도
+                    resp = requests.get(BASE_URL + endpoint, params={"cursor": cursor} if cursor else {}, timeout=60)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        break
+                    elif resp.status_code == 429:
+                        wait_time = (2 ** i) + 1
+                        print(f"\n[Rate Limit] 429 error. Waiting {wait_time}s...", end="", flush=True)
+                        time.sleep(wait_time)
+                    else:
+                        print(f"\n[Error] API {resp.status_code} on {kind}", flush=True)
+                        break
                 
-                data = resp.json()
+                if not data: break
                 items = data.get(list_key, [])
                 if not items: break
 
@@ -148,6 +154,7 @@ def main():
                 cursor = data.get("cursor") or data.get("next_cursor")
                 state["cursors"][kind] = cursor
                 if not cursor: break
+                time.sleep(0.5) # 기본 요청 간격 증가 (Rate limit 방지)
             
             print(f"Done. Total: {kind_count:,}", flush=True)
 
