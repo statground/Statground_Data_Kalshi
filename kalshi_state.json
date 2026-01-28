@@ -1,13 +1,13 @@
 {
   "cursors": {
     "series": null,
-    "event": "CgYI0MHgywYSFEtYQlRDMTVNLTI2SkFOMjYyMTE1",
-    "market": "CgwIx5boywYQ-OrsqgESOUtYTVZFU1BPUlRTTVVMVElHQU1FRVhURU5ERUQtUzIwMjU2QjlENTg3RDgwRi02OTY4RUM3OUJFOA"
+    "event": "CgYIoKzLywYSGktYTkNBQVdCR0FNRS0yNkpBTjIySU9XQU1E",
+    "market": "CgsImZPoywYQqI7yeRI5S1hNVkVTUE9SVFNNVUxUSUdBTUVFWFRFTkRFRC1TMjAyNTg1RDQ0QjBGQUZBLThFMTlCM0ZCMkQ4"
   },
   "rollover": {},
   "repos_seen": [
-    "Statground_Data_Kalshi_Events_2026_001",
+    "Statground_Data_Kalshi_Series",
     "Statground_Data_Kalshi_Markets_2026_001",
-    "Statground_Data_Kalshi_Series"
+    "Statground_Data_Kalshi_Events_2026_001"
   ]
 }
