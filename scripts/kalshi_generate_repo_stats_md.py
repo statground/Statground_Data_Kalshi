@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 def update_stats():
-    """상태 파일을 읽어 실시간 통계 리포트를 생성합니다."""
     state_path = Path("kalshi_state.json")
     out_md = Path("KALSHI_REPO_STATS.md")
     owner = os.environ.get("GITHUB_OWNER", "statground")
@@ -24,23 +23,21 @@ def update_stats():
             f"**Target Owner:** `{owner}`",
             "",
             "## 🗄️ Active Storage (Rollover)",
-            "| Repo Prefix | Current Index | Status |",
+            "| Repo Prefix | Index | Status |",
             "|---|:---:|---|",
         ]
 
         for prefix, index in rollover.items():
-            lines.append(f"| {prefix} | `{index:03d}` | 🟢 Writing |")
+            lines.append(f"| {prefix} | `{index:03d}` | 🟢 Active |")
 
-        lines.append("\n## 📂 All Created Repositories")
+        lines.append("\n## 📂 Created Repositories")
         for repo in sorted(repos):
             lines.append(f"- [{repo}](https://github.com/{owner}/{repo})")
 
-        lines.append("\n---")
-        lines.append("*Note: This report is updated automatically during the crawl.*")
-
         out_md.write_text("\n".join(lines), encoding="utf-8")
+        print("Stats MD updated.")
     except Exception as e:
-        print(f"Stats error: {e}")
+        print(f"Stats Error: {e}")
 
 if __name__ == "__main__":
     update_stats()
