@@ -18,19 +18,19 @@ def update_stats():
         rollover = state.get("rollover", {})
         
         lines = [
-            "# 📊 Kalshi Data Pipeline Stats",
-            f"**Last Sync (UTC):** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-            f"**Target Owner:** `{owner}`",
+            "# 📊 Kalshi Pipeline Real-time Stats",
+            f"**마지막 갱신 (UTC):** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"**대상 계정:** `{owner}`",
             "",
-            "## 🗄️ Active Storage (Rollover)",
-            "| Repo Prefix | Index | Status |",
+            "## 🗄️ 활성 저장소 인덱스",
+            "| 데이터 구분 | 현재 인덱스 | 상태 |",
             "|---|:---:|---|",
         ]
 
         for prefix, index in rollover.items():
-            lines.append(f"| {prefix} | `{index:03d}` | 🟢 Active |")
+            lines.append(f"| {prefix} | `{index:03d}` | 🟢 수집 중 |")
 
-        lines.append("\n## 📂 Created Repositories")
+        lines.append("\n## 📂 전체 데이터 저장소 목록")
         for repo in sorted(list(set(repos))):
             lines.append(f"- [{repo}](https://github.com/{owner}/{repo})")
 
