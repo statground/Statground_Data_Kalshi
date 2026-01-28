@@ -1,8 +1,10 @@
 # 📊 Kalshi Pipeline Real-time Stats
-**Last Sync:** 2026-01-28 15:47:58 UTC
+**마지막 갱신 (UTC):** 2026-01-28 15:50:35
+**대상 계정:** `statground`
 
-## 🗄️ Active Storage
-| Prefix | Current Index | Status |
-|---|---|---|
+## 🗄️ 활성 저장소 인덱스
+| 데이터 구분 | 현재 인덱스 | 상태 |
+|---|:---:|---|
 
-## 📂 Repository List
+## 📂 전체 데이터 저장소 목록
+- [Statground_Data_Kalshi_Series](https://github.com/statground/Statground_Data_Kalshi_Series)
