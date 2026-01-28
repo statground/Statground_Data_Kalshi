@@ -24,13 +24,12 @@ STATE_PATH = Path("kalshi_state.json")
 WORK_DIR = Path(".work")
 WORK_REPOS_DIR = WORK_DIR / "repos"
 
-REPO_MAX_BYTES = int(os.environ.get("REPO_MAX_BYTES", str(1 * 1024**3))) # 1GB
 COMMIT_EVERY_FILES = int(os.environ.get("COMMIT_EVERY_FILES", "5000"))
-FINISH_BUFFER_SEC = 15 * 60 
+FINISH_BUFFER_SEC = 15 * 60 # 15분 안전 버퍼
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- Git & Sync ---
+# --- Utilities ---
 def sync_orchestrator(msg):
     repo_rel = os.environ.get('GITHUB_REPOSITORY', f"{OWNER}/Statground_Data_Kalshi")
     remote_url = f"https://x-access-token:{GH_PAT}@github.com/{repo_rel}.git"
@@ -44,14 +43,17 @@ def sync_orchestrator(msg):
 
 def should_stop():
     now = dt.datetime.now(dt.timezone.utc)
-    sched_utc = [15, 21, 3, 9] # KST 0, 6, 12, 18시
+    sched_utc = [15, 21, 3, 9] # KST 0, 6, 12, 18시 기준 UTC
     next_h = min([h for h in sched_utc if h > now.hour] or [min(sched_utc)])
     target = now.replace(hour=next_h, minute=0, second=0, microsecond=0)
     if next_h <= now.hour: target += dt.timedelta(days=1)
+    
     rem_sec = (target - now).total_seconds()
-    return rem_sec < FINISH_BUFFER_SEC or (time.time() - START_TIME) > 19800
+    if rem_sec < FINISH_BUFFER_SEC:
+        print(f"\n[Safety Stop] Next schedule in {rem_sec/60:.1f} min. Syncing and exiting...", flush=True)
+        return True
+    return False
 
-# --- Sharding Path Logic ---
 def get_path_info(kind, obj):
     ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
     if isinstance(ts_val, str):
@@ -65,7 +67,7 @@ def get_path_info(kind, obj):
     shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
     return f"{kind}s/{status}/{y}/{m}/{shard}/{tid}.json", y
 
-# --- Writer & Main ---
+# --- Writer Class ---
 class RepoWriter:
     def __init__(self, repo_name):
         self.repo = repo_name
@@ -74,7 +76,6 @@ class RepoWriter:
 
     def open(self):
         if not (self.local_path / ".git").exists():
-            requests.post("https://api.github.com/user/repos", headers={"Authorization": f"token {GH_PAT}"}, json={"name": self.repo})
             url = f"https://x-access-token:{GH_PAT}@github.com/{OWNER}/{self.repo}.git"
             subprocess.run(["git", "clone", "--depth", "1", url, str(self.local_path)], check=False)
             subprocess.run(["git", "config", "user.name", "github-actions"], cwd=self.local_path, check=False)
@@ -102,15 +103,18 @@ def main():
         for w in wm.values(): w.flush()
         state["repos_seen"] = list(set(state.get("repos_seen", [])))
         STATE_PATH.write_text(json.dumps(state, indent=2))
-        stats_gen.update_stats() # 통계 MD 갱신
-        sync_orchestrator(msg) # 오케스트레이터 Push
+        stats_gen.update_stats()
+        sync_orchestrator(msg)
 
     try:
-        print("Crawl started...")
+        print(">>> Kalshi Crawl Started.", flush=True)
         for kind in ["series", "event", "market"]:
             endpoint = f"/{kind if kind == 'series' else kind + 's'}"
             list_key = kind if kind == 'series' else kind + 's'
             cursor = state["cursors"].get(kind)
+            
+            print(f"Processing {kind.upper()}...", end=" ", flush=True)
+            kind_count = 0
             
             while True:
                 if should_stop():
@@ -118,7 +122,10 @@ def main():
                     return
 
                 resp = requests.get(BASE_URL + endpoint, params={"cursor": cursor} if cursor else {}, timeout=60)
-                if resp.status_code != 200: break
+                if resp.status_code != 200:
+                    print(f"\n[Error] API {resp.status_code} on {kind}", flush=True)
+                    break
+                
                 data = resp.json()
                 items = data.get(list_key, [])
                 if not items: break
@@ -131,15 +138,18 @@ def main():
                     if repo_name not in state["repos_seen"]: state["repos_seen"].append(repo_name)
                     if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
                     
-                    wm[repo_name].write(rel, obj) # 데이터 쓰기 실행
+                    wm[repo_name].write(rel, obj)
+                    kind_count += 1
                     
-                    if wm[repo_name]._count >= COMMIT_EVERY_FILES:
+                    if kind_count % COMMIT_EVERY_FILES == 0:
+                        print(f"({kind_count:,})", end=" ", flush=True)
                         checkpoint(f"kalshi: {kind} progress")
 
                 cursor = data.get("cursor") or data.get("next_cursor")
                 state["cursors"][kind] = cursor
                 if not cursor: break
-                time.sleep(0.1)
+            
+            print(f"Done. Total: {kind_count:,}", flush=True)
 
         checkpoint("kalshi: run finished")
     except Exception as e:

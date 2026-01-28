@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 def count_files(directory):
-    """디렉토리 내의 .git을 제외한 모든 파일 개수를 세기"""
     total = 0
     if not os.path.exists(directory): return 0
     for root, dirs, files in os.walk(directory):
@@ -30,21 +29,18 @@ def update_stats():
             f"**마지막 갱신 (UTC):** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
             "",
             "## 🗄️ 데이터 저장소별 수집 현황",
-            "| 저장소 명 | 파일 개수 (로컬 집계) | 상태 |",
+            "| 저장소 명 | 파일 개수 (로컬) | 상태 |",
             "|---|---:|---|",
         ]
 
         grand_total = 0
         for repo in sorted(list(set(repos_seen))):
-            repo_path = repos_base / repo
-            f_count = count_files(repo_path)
+            f_count = count_files(repos_base / repo)
             grand_total += f_count
-            lines.append(f"| [{repo}](https://github.com/{owner}/{repo}) | `{f_count:,}` | 🟢 활성 |")
+            lines.append(f"| [{repo}](https://github.com/{owner}/{repo}) | `{f_count:,}` | 🟢 수집 중 |")
 
         lines.append(f"| **전체 합계** | **`{grand_total:,}`** | |")
-        lines.append("\n---")
-        lines.append("*참고: 데이터는 5,000개 단위로 실제 Push되며, 위 수치는 현재 작업 서버의 실시간 개수입니다.*")
-
+        lines.append("\n*참고: 배치가 종료되거나 5,000개 단위로 Push될 때 실제 저장소에 반영됩니다.*")
         out_md.write_text("\n".join(lines), encoding="utf-8")
     except Exception as e:
         print(f"Stats Error: {e}")
