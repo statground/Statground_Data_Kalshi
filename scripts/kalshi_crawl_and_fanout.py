@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 import kalshi_generate_repo_stats_md as stats_gen
 
-# --- Configuration (기존 소스 파라미터 반영) ---
+# --- Configuration ---
 START_TIME = time.time()
 NOW_UTC = dt.datetime.now(dt.timezone.utc)
 OWNER = os.environ.get("GITHUB_OWNER", "statground").strip()
@@ -25,17 +25,13 @@ MANIFEST_PATH = Path("KALSHI_REPOS.json")
 WORK_DIR = Path(".work")
 WORK_REPOS_DIR = WORK_DIR / "repos"
 
-# 파일 용량 및 커밋 주기
 REPO_MAX_BYTES = int(os.environ.get("REPO_MAX_BYTES", str(1 * 1024**3))) 
 COMMIT_EVERY_FILES = int(os.environ.get("COMMIT_EVERY_FILES", "5000"))
 FINISH_BUFFER_SEC = int(os.environ.get("FINISH_BEFORE_NEXT_SCHEDULE_MINUTES", "15")) * 60
 
-# 백필 설정 (기존 소스 참고)
-EVENT_BACKFILL_SEC = int(os.environ.get("KALSHI_EVENT_BACKFILL_SEC", "172800")) # 48h
-
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- GitHub API & Git Helpers ---
+# --- GitHub & Git Helpers ---
 def gh_create_repo(repo_name):
     url = "https://api.github.com/user/repos"
     headers = {"Authorization": f"token {GH_PAT}", "Accept": "application/vnd.github+json"}
@@ -59,36 +55,13 @@ def sync_orchestrator(msg):
 
 def should_stop():
     now = dt.datetime.now(dt.timezone.utc)
-    # 다음 KST 배차 시간 계산
     scheds = [0, 6, 12, 18, 24]
     next_h = min([h for h in scheds if h > now.hour] or [0])
     target = now.replace(hour=next_h % 24, minute=0, second=0, microsecond=0)
     if next_h == 24 or (next_h == 0 and now.hour >= 18): target += dt.timedelta(days=1)
-    
-    rem_sec = (target - now).total_seconds()
-    if rem_sec < FINISH_BUFFER_SEC:
-        print(f"Safety Stop: {rem_sec/60:.1f} min until next schedule.")
-        return True
-    return False
+    return (target - now).total_seconds() < FINISH_BUFFER_SEC
 
-# --- Path & Writer ---
-def get_path_info(kind, obj):
-    # 기존 소스의 정교한 시간 파싱 적용
-    ts_val = obj.get("created_time") or obj.get("open_time") or obj.get("close_time") or time.time()
-    if isinstance(ts_val, str):
-        try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
-        except: ts = time.time()
-    else: ts = float(ts_val)
-    
-    d = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
-    y, m = f"{d.year:04d}", f"{d.month:02d}"
-    status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
-    tid = str(obj.get("ticker") or obj.get("id"))
-    shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
-    
-    rel = f"{kind}s/{status}/{y}/{m}/{shard}/{tid}.json"
-    return rel, y
-
+# --- Writer Class ---
 class RepoWriter:
     def __init__(self, repo_name):
         self.repo = repo_name
@@ -117,11 +90,26 @@ class RepoWriter:
             run_git(["git", "push"], cwd=self.local_path)
             self._count = 0
 
-# --- Main Crawler ---
+# --- Path Parser ---
+def parse_path(kind, obj):
+    ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
+    if isinstance(ts_val, str):
+        try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
+        except: ts = time.time()
+    else: ts = float(ts_val)
+    d = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    y, m = f"{d.year:04d}", f"{d.month:02d}"
+    status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
+    tid = str(obj.get("ticker") or obj.get("id"))
+    shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
+    return f"{kind}s/{status}/{y}/{m}/{shard}/{tid}.json", y
+
+# --- Main ---
 def main():
+    # 상태 파일이 없으면 자동으로 초기화된 딕셔너리 사용
     state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {"cursors": {}, "rollover": {}, "repos_seen": []}
     wm = {}
-    
+
     def checkpoint(msg):
         for w in wm.values(): w.flush()
         state["repos_seen"] = list(set(state.get("repos_seen", [])))
@@ -130,24 +118,20 @@ def main():
         sync_orchestrator(msg)
 
     try:
-        print(f"Crawl Starting... Owner: {OWNER}")
+        print(f"Starting Crawl... State Reset: {not STATE_PATH.exists()}")
         for kind in ["series", "event", "market"]:
             api_path = f"/{kind if kind == 'series' else kind+'s'}"
             list_key = kind if kind == 'series' else kind+'s'
-            cursor = state.get("cursors", {}).get(kind)
+            cursor = state["cursors"].get(kind)
             
-            print(f"Fetching {kind} (Cursor: {cursor})")
+            print(f"Processing {kind}...")
             while True:
-                params = {"cursor": cursor} if cursor else {}
-                # [중요] 필터링 파라미터가 너무 좁으면 데이터가 안 올 수 있음
-                resp = requests.get(BASE_URL + api_path, params=params, timeout=60).json()
+                resp = requests.get(BASE_URL + api_path, params={"cursor": cursor} if cursor else {}, timeout=60).json()
                 items = resp.get(list_key, [])
-                
-                print(f"  > Received {len(items)} {kind} items.")
                 if not items: break
                 
                 for obj in items:
-                    rel, year = get_path_info(kind, obj)
+                    rel, year = parse_path(kind, obj)
                     prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
                     idx = state["rollover"].get(prefix, 1)
                     repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
@@ -156,19 +140,17 @@ def main():
                     if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
                     
                     wm[repo_name].write(rel, obj)
-                    
                     if wm[repo_name]._count >= COMMIT_EVERY_FILES:
                         checkpoint(f"kalshi: {kind} progress")
 
                 cursor = resp.get("cursor") or resp.get("next_cursor")
-                state.setdefault("cursors", {})[kind] = cursor
+                state["cursors"][kind] = cursor
                 if not cursor or should_stop(): break
-                time.sleep(0.05) # Rate limit 방지 
             if should_stop(): break
-
+        
         checkpoint("kalshi: run finished")
     except Exception as e:
-        checkpoint(f"kalshi: error backup ({str(e)[:50]})")
+        checkpoint(f"kalshi: emergency backup ({str(e)[:50]})")
         raise
 
 if __name__ == "__main__":
