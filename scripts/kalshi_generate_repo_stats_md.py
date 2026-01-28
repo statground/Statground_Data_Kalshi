@@ -37,10 +37,9 @@ def update_stats():
         for repo in sorted(list(set(repos_seen))):
             f_count = count_files(repos_base / repo)
             grand_total += f_count
-            lines.append(f"| [{repo}](https://github.com/{owner}/{repo}) | `{f_count:,}` | 🟢 수집 중 |")
+            lines.append(f"| [{repo}](https://github.com/{owner}/{repo}) | `{f_count:,}` | 🟢 활성 |")
 
         lines.append(f"| **전체 합계** | **`{grand_total:,}`** | |")
-        lines.append("\n*참고: 배치가 종료되거나 5,000개 단위로 Push될 때 실제 저장소에 반영됩니다.*")
         out_md.write_text("\n".join(lines), encoding="utf-8")
     except Exception as e:
         print(f"Stats Error: {e}")
