@@ -1,9 +1,8 @@
 __pycache__/
 *.pyc
-.DS_Store
 .work/
 
-# 상태 파일과 통계 파일은 추적 대상에 포함 
+# 상태 및 통계 파일 추적 강제
 !kalshi_state.json
 !KALSHI_REPO_STATS.md
 !KALSHI_REPOS.json
