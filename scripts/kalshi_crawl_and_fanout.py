@@ -31,7 +31,7 @@ FINISH_BUFFER_SEC = int(os.environ.get("FINISH_BEFORE_NEXT_SCHEDULE_MINUTES", "1
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- GitHub & Git Helpers ---
+# --- Git & GitHub Helpers ---
 def gh_create_repo(repo_name):
     url = "https://api.github.com/user/repos"
     headers = {"Authorization": f"token {GH_PAT}", "Accept": "application/vnd.github+json"}
@@ -61,7 +61,7 @@ def should_stop():
     if next_h == 24 or (next_h == 0 and now.hour >= 18): target += dt.timedelta(days=1)
     return (target - now).total_seconds() < FINISH_BUFFER_SEC
 
-# --- Writer Class ---
+# --- Data Writer ---
 class RepoWriter:
     def __init__(self, repo_name):
         self.repo = repo_name
@@ -90,23 +90,25 @@ class RepoWriter:
             run_git(["git", "push"], cwd=self.local_path)
             self._count = 0
 
-# --- Path Parser ---
+# --- Helper Functions ---
 def parse_path(kind, obj):
-    ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
+    # 날짜 추출
+    ts_val = obj.get("created_time") or obj.get("open_time") or obj.get("last_updated_time") or time.time()
     if isinstance(ts_val, str):
         try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
         except: ts = time.time()
     else: ts = float(ts_val)
     d = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
     y, m = f"{d.year:04d}", f"{d.month:02d}"
+    
+    # 상태 및 경로 생성
     status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
     tid = str(obj.get("ticker") or obj.get("id"))
     shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
     return f"{kind}s/{status}/{y}/{m}/{shard}/{tid}.json", y
 
-# --- Main ---
+# --- Main Crawler ---
 def main():
-    # 상태 파일이 없으면 자동으로 초기화된 딕셔너리 사용
     state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {"cursors": {}, "rollover": {}, "repos_seen": []}
     wm = {}
 
@@ -119,38 +121,75 @@ def main():
 
     try:
         print(f"Starting Crawl... State Reset: {not STATE_PATH.exists()}")
+        
+        # 순서: Series -> Events -> Markets
         for kind in ["series", "event", "market"]:
-            api_path = f"/{kind if kind == 'series' else kind+'s'}"
-            list_key = kind if kind == 'series' else kind+'s'
+            # API 경로 및 키 설정
+            api_endpoint = f"/{kind if kind == 'series' else kind + 's'}"
+            list_key = kind if kind == 'series' else kind + 's'
             cursor = state["cursors"].get(kind)
             
-            print(f"Processing {kind}...")
+            print(f"--- Processing {kind.upper()} (Cursor: {cursor}) ---")
+            
             while True:
-                resp = requests.get(BASE_URL + api_path, params={"cursor": cursor} if cursor else {}, timeout=60).json()
+                # API 호출
+                url = BASE_URL + api_endpoint
+                params = {"cursor": cursor} if cursor else {}
+                if kind == 'event': params["limit"] = 200 # 이벤트는 보통 크게 가져옴
+                
+                resp_raw = requests.get(url, params=params, timeout=60)
+                if resp_raw.status_code != 200:
+                    print(f"  [Error] API Returned {resp_raw.status_code}: {resp_raw.text}")
+                    break
+                
+                resp = resp_raw.json()
                 items = resp.get(list_key, [])
-                if not items: break
+                print(f"  [Info] Received {len(items)} {kind} items.")
+                
+                if not items:
+                    break
                 
                 for obj in items:
                     rel, year = parse_path(kind, obj)
-                    prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
-                    idx = state["rollover"].get(prefix, 1)
-                    repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
                     
-                    if repo_name not in state["repos_seen"]: state["repos_seen"].append(repo_name)
-                    if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
+                    # 저장소 이름 결정
+                    if kind == "series":
+                        repo_name = "Statground_Data_Kalshi_Series"
+                    else:
+                        prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}"
+                        idx = state["rollover"].get(prefix, 1)
+                        repo_name = f"{prefix}_{idx:03d}"
+                    
+                    if repo_name not in state["repos_seen"]:
+                        state["repos_seen"].append(repo_name)
+                    
+                    if repo_name not in wm:
+                        wm[repo_name] = RepoWriter(repo_name)
                     
                     wm[repo_name].write(rel, obj)
+                    
+                    # 커밋 주기 체크
                     if wm[repo_name]._count >= COMMIT_EVERY_FILES:
-                        checkpoint(f"kalshi: {kind} progress")
+                        checkpoint(f"kalshi: {kind} progress checkpoint")
 
+                # 다음 페이지 확인
                 cursor = resp.get("cursor") or resp.get("next_cursor")
                 state["cursors"][kind] = cursor
-                if not cursor or should_stop(): break
-            if should_stop(): break
+                
+                if not cursor or should_stop():
+                    break
+                
+                time.sleep(0.1) # 안전을 위한 짧은 지연
+                
+            if should_stop():
+                print(">>> Time buffer reached. Stopping crawl.")
+                break
         
-        checkpoint("kalshi: run finished")
+        checkpoint("kalshi: run finished successfully")
+        
     except Exception as e:
-        checkpoint(f"kalshi: emergency backup ({str(e)[:50]})")
+        print(f"!!! Fatal Error: {e}")
+        checkpoint(f"kalshi: emergency backup on error")
         raise
 
 if __name__ == "__main__":
