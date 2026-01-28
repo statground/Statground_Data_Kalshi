@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 .work/
 
-# 상태 및 통계 파일 추적 강제
+# 아래 파일들은 실시간 관제를 위해 절대 ignore 하지 않음
 !kalshi_state.json
 !KALSHI_REPO_STATS.md
-!KALSHI_REPOS.json
