@@ -31,11 +31,10 @@ def update_stats():
             lines.append(f"| {prefix} | `{index:03d}` | 🟢 Active |")
 
         lines.append("\n## 📂 Created Repositories")
-        for repo in sorted(repos):
+        for repo in sorted(list(set(repos))):
             lines.append(f"- [{repo}](https://github.com/{owner}/{repo})")
 
         out_md.write_text("\n".join(lines), encoding="utf-8")
-        print("Stats MD updated.")
     except Exception as e:
         print(f"Stats Error: {e}")
 

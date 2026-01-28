@@ -7,7 +7,6 @@ import json
 import time
 import shutil
 import hashlib
-import logging
 import subprocess
 import datetime as dt
 from pathlib import Path
@@ -32,11 +31,34 @@ FINISH_BUFFER_SEC = int(os.environ.get("FINISH_BEFORE_NEXT_SCHEDULE_MINUTES", "1
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- Utilities ---
+# --- GitHub API Helpers ---
+def gh_create_repo(repo_name):
+    """저장소가 없으면 GitHub에 생성합니다."""
+    url = "https://api.github.com/user/repos"
+    headers = {
+        "Authorization": f"token {GH_PAT}",
+        "Accept": "application/vnd.github+json"
+    }
+    # 만약 OWNER가 개인 계정이 아니라 조직(Org)이라면 URL을 바꿔야 합니다.
+    # 여기서는 개인 계정 생성을 기본으로 합니다.
+    payload = {
+        "name": repo_name,
+        "private": False,
+        "description": f"Statground Kalshi Data Shard: {repo_name}"
+    }
+    r = requests.post(url, headers=headers, json=payload)
+    if r.status_code == 201:
+        print(f"Successfully created repository: {repo_name}")
+        return True
+    elif r.status_code == 422: # 이미 존재하는 경우
+        return True
+    else:
+        print(f"Failed to create repo {repo_name}: {r.status_code} {r.text}")
+        return False
+
+# --- Git Utilities ---
 def run_git(cmd, cwd=None, check=True):
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
-    if check and p.returncode != 0:
-        print(f"Git Cmd Failed: {' '.join(cmd)}\nError: {p.stderr}")
     return p
 
 def sync_orchestrator(msg):
@@ -51,20 +73,17 @@ def sync_orchestrator(msg):
 
 def should_stop():
     now = dt.datetime.now(dt.timezone.utc)
-    # 다음 0, 6, 12, 18시 정각 계산 
     scheds = [0, 6, 12, 18, 24]
     next_h = min([h for h in scheds if h > now.hour] or [0])
     target = now.replace(hour=next_h % 24, minute=0, second=0, microsecond=0)
     if next_h == 24 or (next_h == 0 and now.hour >= 18): target += dt.timedelta(days=1)
     return (target - now).total_seconds() < FINISH_BUFFER_SEC
 
-# --- Sharding & Path Logic ---
+# --- Sharding Path Logic ---
 def get_relpath(kind, obj):
-    # 기존 복잡한 경로 생성 로직 복원
     status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
-    # 시간 필드 파싱 (created_time 등)
     ts = obj.get("created_time") or obj.get("open_time") or time.time()
-    if isinstance(ts, str): 
+    if isinstance(ts, str):
         try: ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         except: ts = time.time()
     d = dt.datetime.fromtimestamp(float(ts), tz=dt.timezone.utc)
@@ -83,11 +102,14 @@ class RepoWriter:
     def ensure_repo(self):
         if not (self.local_path / ".git").exists():
             if self.local_path.exists(): shutil.rmtree(self.local_path)
-            # 저장소가 없으면 생성하는 로직은 GitHub API 권한 필요하므로 여기선 클론 시도
+            # 1. GitHub API로 저장소 존재 보장 (없으면 생성)
+            gh_create_repo(self.repo)
+            
+            # 2. 클론 시도
             url = f"https://x-access-token:{GH_PAT}@github.com/{OWNER}/{self.repo}.git"
             res = run_git(["git", "clone", "--depth", "1", url, str(self.local_path)], check=False)
             if res.returncode != 0:
-                print(f"Repo {self.repo} might not exist. Check auto-create settings.")
+                print(f"Still failing to clone {self.repo}. Check PAT permissions.")
                 return False
             run_git(["git", "config", "user.name", "github-actions"], cwd=self.local_path)
             run_git(["git", "config", "user.email", "actions@github.com"], cwd=self.local_path)
@@ -103,7 +125,7 @@ class RepoWriter:
     def flush(self):
         if self._count > 0 and self.local_path.exists():
             run_git(["git", "add", "-A"], cwd=self.local_path)
-            run_git(["git", "commit", "-m", f"update data {NOW_UTC}"], cwd=self.local_path, check=False)
+            run_git(["git", "commit", "-m", f"kalshi: update data {NOW_UTC}"], cwd=self.local_path, check=False)
             run_git(["git", "push"], cwd=self.local_path, check=False)
             self._count = 0
 
@@ -120,30 +142,33 @@ def main():
         sync_orchestrator(msg)
 
     try:
-        print("Crawl started...")
+        print("Crawl started with auto-create capability...")
         for kind in ["series", "event", "market"]:
-            # API 경로 결정 (/series, /events, /markets)
             api_path = f"/{kind if kind == 'series' else kind+'s'}"
             list_key = kind if kind == 'series' else kind+'s'
-            
             cursor = state.get("cursors", {}).get(kind)
+            
             while True:
                 params = {"cursor": cursor} if cursor else {}
-                resp = requests.get(BASE_URL + api_path, params=params, timeout=60).json()
+                try:
+                    resp = requests.get(BASE_URL + api_path, params=params, timeout=60).json()
+                except Exception as e:
+                    print(f"API Error: {e}")
+                    break
+                    
                 items = resp.get(list_key, [])
-                
                 for obj in items:
                     rel, year = get_relpath(kind, obj)
-                    # 롤오버 인덱스 관리
                     prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
                     idx = state["rollover"].get(prefix, 1)
                     repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
                     
-                    state["repos_seen"].append(repo_name)
+                    if repo_name not in state["repos_seen"]:
+                        state["repos_seen"].append(repo_name)
+                    
                     if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
                     wm[repo_name].write(rel, obj)
                     
-                    # 용량 체크 및 롤오버 (단순화)
                     if wm[repo_name]._count >= COMMIT_EVERY_FILES:
                         checkpoint(f"kalshi: {kind} progress")
 
