@@ -1,4 +1,4 @@
-name: Kalshi Crawl + Fan-out (Enhanced Sync)
+name: Kalshi Crawl + Fan-out
 
 on:
   workflow_dispatch:
@@ -6,26 +6,28 @@ on:
     - cron: "0 15,21,3,9 * * *"
 
 permissions:
-  [cite_start]contents: write # Orchestrator에 상태를 쓰기 위해 필수 
+  contents: write
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    env:
-      GH_PAT: ${{ secrets.GH_PAT }}
-      REPO_MAX_BYTES: "1073741824" # 1GiB 기준 분할
     steps:
-      - name: Checkout
+      - name: Checkout orchestrator
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 전체 히스토리 필요
+          fetch-depth: 0 # Push 충돌 방지를 위해 전체 이력 필요
+          token: ${{ secrets.GH_PAT }} # 권한이 충분한 PAT 사용 권장
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run Crawler
-        run: |
-          pip install requests
-          python scripts/kalshi_crawl_and_fanout.py
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Crawl & Stats
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_OWNER: "statground"
+        run: python scripts/kalshi_crawl_and_fanout.py
