@@ -31,14 +31,31 @@ FINISH_BUFFER_SEC = int(os.environ.get("FINISH_BEFORE_NEXT_SCHEDULE_MINUTES", "1
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- Git & GitHub Helpers ---
-def gh_create_repo(repo_name):
-    url = "https://api.github.com/user/repos"
-    headers = {"Authorization": f"token {GH_PAT}", "Accept": "application/vnd.github+json"}
-    payload = {"name": repo_name, "private": False, "description": f"Kalshi Data: {repo_name}"}
-    r = requests.post(url, headers=headers, json=payload)
-    return r.status_code in [201, 422]
+# --- API Helper with Rate Limit Handling ---
+def api_request_with_retry(url, params, max_retries=5):
+    """429 에러 발생 시 지수 백오프로 재시도하는 헬퍼 함수"""
+    retries = 0
+    backoff = 2  # 시작 대기 시간 (초)
+    
+    while retries < max_retries:
+        resp = requests.get(url, params=params, timeout=60)
+        
+        if resp.status_code == 200:
+            return resp.json()
+        
+        if resp.status_code == 429:
+            print(f"  [Rate Limit] 429 에러 발생. {backoff}초 대기 후 재시도... ({retries+1}/{max_retries})")
+            time.sleep(backoff)
+            retries += 1
+            backoff *= 2 # 대기 시간 두 배 증가
+            continue
+        
+        print(f"  [Error] API {resp.status_code}: {resp.text}")
+        return None
+    
+    return None
 
+# --- Git & GitHub Helpers (기존 동일) ---
 def run_git(cmd, cwd=None):
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
 
@@ -61,7 +78,7 @@ def should_stop():
     if next_h == 24 or (next_h == 0 and now.hour >= 18): target += dt.timedelta(days=1)
     return (target - now).total_seconds() < FINISH_BUFFER_SEC
 
-# --- Data Writer ---
+# --- Writer Class ---
 class RepoWriter:
     def __init__(self, repo_name):
         self.repo = repo_name
@@ -70,7 +87,10 @@ class RepoWriter:
 
     def open(self):
         if not (self.local_path / ".git").exists():
-            gh_create_repo(self.repo)
+            # 저장소 생성 API 호출 (생략 가능하나 안전을 위해 포함)
+            requests.post("https://api.github.com/user/repos", 
+                          headers={"Authorization": f"token {GH_PAT}"}, 
+                          json={"name": self.repo})
             url = f"https://x-access-token:{GH_PAT}@github.com/{OWNER}/{self.repo}.git"
             run_git(["git", "clone", "--depth", "1", url, str(self.local_path)])
             run_git(["git", "config", "user.name", "github-actions"], cwd=self.local_path)
@@ -92,7 +112,6 @@ class RepoWriter:
 
 # --- Helper Functions ---
 def parse_path(kind, obj):
-    # 날짜 추출
     ts_val = obj.get("created_time") or obj.get("open_time") or obj.get("last_updated_time") or time.time()
     if isinstance(ts_val, str):
         try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
@@ -100,8 +119,6 @@ def parse_path(kind, obj):
     else: ts = float(ts_val)
     d = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
     y, m = f"{d.year:04d}", f"{d.month:02d}"
-    
-    # 상태 및 경로 생성
     status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
     tid = str(obj.get("ticker") or obj.get("id"))
     shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
@@ -120,11 +137,9 @@ def main():
         sync_orchestrator(msg)
 
     try:
-        print(f"Starting Crawl... State Reset: {not STATE_PATH.exists()}")
+        print(f"Starting Crawl... (Rate Limit Patch Applied)")
         
-        # 순서: Series -> Events -> Markets
         for kind in ["series", "event", "market"]:
-            # API 경로 및 키 설정
             api_endpoint = f"/{kind if kind == 'series' else kind + 's'}"
             list_key = kind if kind == 'series' else kind + 's'
             cursor = state["cursors"].get(kind)
@@ -132,17 +147,17 @@ def main():
             print(f"--- Processing {kind.upper()} (Cursor: {cursor}) ---")
             
             while True:
-                # API 호출
                 url = BASE_URL + api_endpoint
                 params = {"cursor": cursor} if cursor else {}
-                if kind == 'event': params["limit"] = 200 # 이벤트는 보통 크게 가져옴
+                if kind == 'event': params["limit"] = 200
                 
-                resp_raw = requests.get(url, params=params, timeout=60)
-                if resp_raw.status_code != 200:
-                    print(f"  [Error] API Returned {resp_raw.status_code}: {resp_raw.text}")
+                # 재시도 로직이 포함된 요청
+                resp = api_request_with_retry(url, params)
+                
+                if not resp: # 에러가 발생했거나 재시도 끝에 실패한 경우
+                    print(f"  [Warning] {kind} 수집 중단됨 (API 응답 없음).")
                     break
                 
-                resp = resp_raw.json()
                 items = resp.get(list_key, [])
                 print(f"  [Info] Received {len(items)} {kind} items.")
                 
@@ -151,8 +166,6 @@ def main():
                 
                 for obj in items:
                     rel, year = parse_path(kind, obj)
-                    
-                    # 저장소 이름 결정
                     if kind == "series":
                         repo_name = "Statground_Data_Kalshi_Series"
                     else:
@@ -162,27 +175,25 @@ def main():
                     
                     if repo_name not in state["repos_seen"]:
                         state["repos_seen"].append(repo_name)
-                    
                     if repo_name not in wm:
                         wm[repo_name] = RepoWriter(repo_name)
                     
                     wm[repo_name].write(rel, obj)
                     
-                    # 커밋 주기 체크
                     if wm[repo_name]._count >= COMMIT_EVERY_FILES:
                         checkpoint(f"kalshi: {kind} progress checkpoint")
 
-                # 다음 페이지 확인
                 cursor = resp.get("cursor") or resp.get("next_cursor")
                 state["cursors"][kind] = cursor
                 
                 if not cursor or should_stop():
                     break
                 
-                time.sleep(0.1) # 안전을 위한 짧은 지연
+                # API 서버 부하 방지를 위한 기본 지연 (0.2초)
+                time.sleep(0.2)
                 
             if should_stop():
-                print(">>> Time buffer reached. Stopping crawl.")
+                print(">>> 다음 스케줄 임박으로 수집을 중단합니다.")
                 break
         
         checkpoint("kalshi: run finished successfully")
