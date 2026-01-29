@@ -31,19 +31,15 @@ for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
 # --- GitHub API Helpers ---
 def gh_create_repo(repo_name):
-    """개인 혹은 조직 계정에 저장소 생성을 시도합니다."""
-    # 1. 먼저 조직 계정 생성을 시도 (statground가 조직인 경우)
-    url = f"https://api.github.com/orgs/{OWNER}/repos"
+    """저장소가 없으면 자동 생성 (개인/조직 공용)"""
     headers = {"Authorization": f"token {GH_PAT}", "Accept": "application/vnd.github+json"}
     payload = {"name": repo_name, "private": False}
-    
-    r = requests.post(url, headers=headers, json=payload)
-    if r.status_code in [201, 422]: return True
-    
-    # 2. 조직 계정 실패 시 개인 계정으로 재시도
-    url = "https://api.github.com/user/repos"
-    r = requests.post(url, headers=headers, json=payload)
-    return r.status_code in [201, 422]
+    # 조직 계정 시도 후 실패 시 개인 계정 시도
+    url_org = f"https://api.github.com/orgs/{OWNER}/repos"
+    r = requests.post(url_org, headers=headers, json=payload)
+    if r.status_code not in [201, 422]:
+        url_user = "https://api.github.com/user/repos"
+        requests.post(url_user, headers=headers, json=payload)
 
 # --- Git & Sync ---
 def sync_orchestrator(msg):
@@ -63,10 +59,22 @@ def should_stop():
     next_h = min([h for h in sched_utc if h > now.hour] or [min(sched_utc)])
     target = now.replace(hour=next_h, minute=0, second=0, microsecond=0)
     if next_h <= now.hour: target += dt.timedelta(days=1)
-    rem_sec = (target - now).total_seconds()
-    return rem_sec < FINISH_BUFFER_SEC or (time.time() - START_TIME) > 19800
+    return (target - now).total_seconds() < FINISH_BUFFER_SEC or (time.time() - START_TIME) > 19800
 
-# --- Writer & Main ---
+def get_path_info(kind, obj):
+    ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
+    if isinstance(ts_val, str):
+        try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
+        except: ts = time.time()
+    else: ts = float(ts_val)
+    d = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    y, m = f"{d.year:04d}", f"{d.month:02d}"
+    status = "closed" if obj.get("status") == "closed" or obj.get("closed") else "open"
+    tid = str(obj.get("ticker") or obj.get("id"))
+    shard = hashlib.sha1(tid.encode()).hexdigest()[:2]
+    return f"{kind}s/{status}/{y}/{m}/{shard}/{tid}.json", y
+
+# --- Writer Class ---
 class RepoWriter:
     def __init__(self, repo_name):
         self.repo = repo_name
@@ -77,17 +85,16 @@ class RepoWriter:
         if not (self.local_path / ".git").exists():
             gh_create_repo(self.repo)
             if self.local_path.exists(): shutil.rmtree(self.local_path)
-            
             url = f"https://x-access-token:{GH_PAT}@github.com/{OWNER}/{self.repo}.git"
             res = subprocess.run(["git", "clone", "--depth", "1", url, str(self.local_path)], capture_output=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"Clone failed for {self.repo}: {res.stderr.decode()}")
-            
-            subprocess.run(["git", "config", "user.name", "github-actions"], cwd=self.local_path, check=False)
-            subprocess.run(["git", "config", "user.email", "actions@github.com"], cwd=self.local_path, check=False)
+            if res.returncode == 0:
+                subprocess.run(["git", "config", "user.name", "github-actions"], cwd=self.local_path, check=False)
+                subprocess.run(["git", "config", "user.email", "actions@github.com"], cwd=self.local_path, check=False)
+            return res.returncode == 0
+        return True
 
     def write(self, rel, obj):
-        self.open()
+        if not self.open(): return
         p = self.local_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(obj, separators=(",", ":")), encoding="utf-8")
@@ -118,12 +125,13 @@ def main():
             list_key = kind if kind == 'series' else kind + 's'
             cursor = state["cursors"].get(kind)
             
+            print(f"Processing {kind.upper()}...", flush=True)
             while True:
                 if should_stop():
                     checkpoint(f"kalshi: {kind} safety stop")
                     return
 
-                # API 호출 (429 에러 대응 지수 백오프)
+                # API 호출 (429 대응)
                 data = None
                 for i in range(5):
                     resp = requests.get(BASE_URL + endpoint, params={"cursor": cursor} if cursor else {}, timeout=60)
@@ -140,17 +148,23 @@ def main():
                 if not items: break
 
                 for obj in items:
-                    # (경로 파싱 및 저장소 이름 결정 로직 parse_path 등은 기존 완전체 유지)
-                    # 여기서는 핵심 흐름만 기술
-                    repo_name = f"Statground_Data_Kalshi_{kind.capitalize()}s_2026_001" # 예시
+                    rel, year = get_path_info(kind, obj)
+                    prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
+                    idx = state["rollover"].get(prefix, 1)
+                    repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
+                    
+                    if repo_name not in state["repos_seen"]: state["repos_seen"].append(repo_name)
                     if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
-                    # wm[repo_name].write(rel, obj)
+                    
+                    # [중요] 실제 데이터 기록
+                    wm[repo_name].write(rel, obj)
                     
                     if wm[repo_name]._count >= COMMIT_EVERY_FILES:
                         checkpoint(f"kalshi: {kind} progress")
 
-                state["cursors"][kind] = data.get("cursor") or data.get("next_cursor")
-                if not state["cursors"][kind]: break
+                cursor = data.get("cursor") or data.get("next_cursor")
+                state["cursors"][kind] = cursor
+                if not cursor: break
                 time.sleep(0.5)
 
         checkpoint("kalshi: run finished")
