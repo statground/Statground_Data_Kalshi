@@ -5,7 +5,6 @@ import os
 import sys
 import json
 import time
-import shutil
 import hashlib
 import subprocess
 import datetime as dt
@@ -24,24 +23,12 @@ STATE_PATH = Path("kalshi_state.json")
 WORK_DIR = Path(".work")
 WORK_REPOS_DIR = WORK_DIR / "repos"
 
-COMMIT_EVERY_FILES = int(os.environ.get("COMMIT_EVERY_FILES", "5000"))
+COMMIT_EVERY_FILES = 5000 
 FINISH_BUFFER_SEC = 15 * 60 
 
 for d in [WORK_DIR, WORK_REPOS_DIR]: d.mkdir(exist_ok=True)
 
-# --- GitHub API Helpers ---
-def gh_create_repo(repo_name):
-    """저장소가 없으면 자동 생성 (개인/조직 공용)"""
-    headers = {"Authorization": f"token {GH_PAT}", "Accept": "application/vnd.github+json"}
-    payload = {"name": repo_name, "private": False}
-    # 조직 계정 시도 후 실패 시 개인 계정 시도
-    url_org = f"https://api.github.com/orgs/{OWNER}/repos"
-    r = requests.post(url_org, headers=headers, json=payload)
-    if r.status_code not in [201, 422]:
-        url_user = "https://api.github.com/user/repos"
-        requests.post(url_user, headers=headers, json=payload)
-
-# --- Git & Sync ---
+# --- GitHub & Logic Helpers ---
 def sync_orchestrator(msg):
     repo_rel = os.environ.get('GITHUB_REPOSITORY', f"{OWNER}/Statground_Data_Kalshi")
     remote_url = f"https://x-access-token:{GH_PAT}@github.com/{repo_rel}.git"
@@ -55,14 +42,17 @@ def sync_orchestrator(msg):
 
 def should_stop():
     now = dt.datetime.now(dt.timezone.utc)
+    # KST 배차 시간 (0, 6, 12, 18시) 기준 UTC 체크
     sched_utc = [15, 21, 3, 9] 
     next_h = min([h for h in sched_utc if h > now.hour] or [min(sched_utc)])
     target = now.replace(hour=next_h, minute=0, second=0, microsecond=0)
     if next_h <= now.hour: target += dt.timedelta(days=1)
-    return (target - now).total_seconds() < FINISH_BUFFER_SEC or (time.time() - START_TIME) > 19800
+    return (target - now).total_seconds() < FINISH_BUFFER_SEC
 
+# --- Data Path Logic ---
 def get_path_info(kind, obj):
-    ts_val = obj.get("created_time") or obj.get("open_time") or time.time()
+    # 날짜 필드 우선순위: created -> open -> close -> now
+    ts_val = obj.get("created_time") or obj.get("open_time") or obj.get("close_time") or time.time()
     if isinstance(ts_val, str):
         try: ts = dt.datetime.fromisoformat(ts_val.replace("Z", "+00:00")).timestamp()
         except: ts = time.time()
@@ -83,18 +73,13 @@ class RepoWriter:
 
     def open(self):
         if not (self.local_path / ".git").exists():
-            gh_create_repo(self.repo)
-            if self.local_path.exists(): shutil.rmtree(self.local_path)
             url = f"https://x-access-token:{GH_PAT}@github.com/{OWNER}/{self.repo}.git"
-            res = subprocess.run(["git", "clone", "--depth", "1", url, str(self.local_path)], capture_output=True)
-            if res.returncode == 0:
-                subprocess.run(["git", "config", "user.name", "github-actions"], cwd=self.local_path, check=False)
-                subprocess.run(["git", "config", "user.email", "actions@github.com"], cwd=self.local_path, check=False)
-            return res.returncode == 0
-        return True
+            subprocess.run(["git", "clone", "--depth", "1", url, str(self.local_path)], check=False)
+            subprocess.run(["git", "config", "user.name", "github-actions"], cwd=self.local_path, check=False)
+            subprocess.run(["git", "config", "user.email", "actions@github.com"], cwd=self.local_path, check=False)
 
     def write(self, rel, obj):
-        if not self.open(): return
+        self.open()
         p = self.local_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(obj, separators=(",", ":")), encoding="utf-8")
@@ -103,10 +88,11 @@ class RepoWriter:
     def flush(self):
         if self._count > 0 and self.local_path.exists():
             subprocess.run(["git", "add", "-A"], cwd=self.local_path, check=False)
-            subprocess.run(["git", "commit", "-m", f"kalshi: update data {NOW_UTC}"], cwd=self.local_path, check=False)
+            subprocess.run(["git", "commit", "-m", f"kalshi: update {NOW_UTC}"], cwd=self.local_path, check=False)
             subprocess.run(["git", "push"], cwd=self.local_path, check=False)
             self._count = 0
 
+# --- Main Crawler ---
 def main():
     state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {"cursors": {}, "rollover": {}, "repos_seen": []}
     wm = {}
@@ -119,57 +105,67 @@ def main():
         sync_orchestrator(msg)
 
     try:
-        print(">>> Kalshi Crawl Started.", flush=True)
+        print(">>> Crawler Restarted with Enhanced Pagination", flush=True)
+        
+        # 순서대로 처리
         for kind in ["series", "event", "market"]:
             endpoint = f"/{kind if kind == 'series' else kind + 's'}"
             list_key = kind if kind == 'series' else kind + 's'
             cursor = state["cursors"].get(kind)
             
-            print(f"Processing {kind.upper()}...", flush=True)
+            print(f"--- Processing {kind.upper()} ---", flush=True)
+            
             while True:
                 if should_stop():
-                    checkpoint(f"kalshi: {kind} safety stop")
+                    checkpoint(f"kalshi: {kind} stop for next schedule")
                     return
 
-                # API 호출 (429 대응)
-                data = None
-                for i in range(5):
-                    resp = requests.get(BASE_URL + endpoint, params={"cursor": cursor} if cursor else {}, timeout=60)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        break
-                    elif resp.status_code == 429:
-                        time.sleep((2 ** i) + 1)
-                        continue
+                params = {"cursor": cursor} if cursor else {}
+                if kind == 'event': params["limit"] = 200 # 이벤트는 크게
+                if kind == 'market': params["limit"] = 1000 # 마켓은 최대치 시도
+                
+                resp_raw = requests.get(BASE_URL + endpoint, params=params, timeout=60)
+                if resp_raw.status_code == 429:
+                    print("Rate limit hit, waiting 30s...", flush=True)
+                    time.sleep(30)
+                    continue
+                if resp_raw.status_code != 200: break
+                
+                data = resp_raw.json()
+                items = data.get(list_key, [])
+                
+                if items:
+                    for obj in items:
+                        rel, year = get_path_info(kind, obj)
+                        prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
+                        idx = state["rollover"].get(prefix, 1)
+                        repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
+                        
+                        if repo_name not in state["repos_seen"]: state["repos_seen"].append(repo_name)
+                        if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
+                        
+                        wm[repo_name].write(rel, obj)
+                        
+                        if wm[repo_name]._count >= COMMIT_EVERY_FILES:
+                            checkpoint(f"kalshi: {kind} progress")
+
+                # [중요] Cursor 업데이트 로직 강화
+                next_cursor = data.get("cursor") or data.get("next_cursor")
+                
+                # 다음 커서가 현재와 같거나 없으면 종료
+                if not next_cursor or next_cursor == cursor:
+                    print(f"Finished {kind}: No more cursors.", flush=True)
                     break
                 
-                if not data: break
-                items = data.get(list_key, [])
-                if not items: break
-
-                for obj in items:
-                    rel, year = get_path_info(kind, obj)
-                    prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{year}" if kind != "series" else "Statground_Data_Kalshi_Series"
-                    idx = state["rollover"].get(prefix, 1)
-                    repo_name = f"{prefix}_{idx:03d}" if kind != "series" else prefix
-                    
-                    if repo_name not in state["repos_seen"]: state["repos_seen"].append(repo_name)
-                    if repo_name not in wm: wm[repo_name] = RepoWriter(repo_name)
-                    
-                    # [중요] 실제 데이터 기록
-                    wm[repo_name].write(rel, obj)
-                    
-                    if wm[repo_name]._count >= COMMIT_EVERY_FILES:
-                        checkpoint(f"kalshi: {kind} progress")
-
-                cursor = data.get("cursor") or data.get("next_cursor")
+                cursor = next_cursor
                 state["cursors"][kind] = cursor
-                if not cursor: break
+                
+                # API 부하 방지
                 time.sleep(0.5)
 
-        checkpoint("kalshi: run finished")
+        checkpoint("kalshi: full run finished")
     except Exception as e:
-        checkpoint(f"kalshi: emergency backup ({str(e)[:50]})")
+        checkpoint(f"kalshi: emergency exit ({str(e)[:50]})")
         raise
 
 if __name__ == "__main__":
