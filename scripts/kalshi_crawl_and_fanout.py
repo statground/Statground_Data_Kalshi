@@ -21,14 +21,14 @@ except ImportError:
 # ------------------------------------------------------------------------------
 
 # [설정] 리포지토리 자동 분할 기준 (파일 수)
-REPO_MAX_FILES = 30000 
+# 사용자의 요청에 따라 100만 개로 상향 조정
+REPO_MAX_FILES = 1000000 
 
-# [설정] 커밋 주기 (파일 수)
-COMMIT_EVERY_FILES = 3000
+# [설정] 커밋 및 통계 갱신 주기 (파일 수)
+# 5,000개마다 데이터 Push 및 메인 저장소 통계 반영
+COMMIT_EVERY_FILES = 5000
 
-# [복구된 기능] 안전 종료 시간 설정
-# GitHub Actions 제한시간(6시간) 전에 안전하게 저장하고 종료하기 위함 (여유분 15분)
-# 1시간 단위 실행이라도, 밀린 데이터가 많으면 6시간을 꽉 채울 수 있음.
+# [설정] 안전 종료 시간 설정 (GitHub Actions 6시간 제한 대비)
 JOB_TIME_LIMIT_SEC = 6 * 3600 
 FINISH_BUFFER_SEC = 15 * 60 
 
@@ -47,11 +47,11 @@ for d in [WORK_DIR, WORK_REPOS_DIR]:
 
 
 # ------------------------------------------------------------------------------
-# 2. Helper Functions (Git & API)
+# 2. GitHub API & Git Helper Functions
 # ------------------------------------------------------------------------------
 
 def ensure_remote_repo(repo_name):
-    """GitHub 리포지토리 존재 확인 및 자동 생성"""
+    """GitHub 리포지토리가 없으면 자동으로 생성"""
     if not GH_PAT: return
 
     headers = {
@@ -59,28 +59,24 @@ def ensure_remote_repo(repo_name):
         "Accept": "application/vnd.github.v3+json"
     }
     
-    # Check existence
     if requests.get(f"https://api.github.com/repos/{OWNER}/{repo_name}", headers=headers).status_code == 200:
         return
     
     print(f"⚠️ Repo '{OWNER}/{repo_name}' not found. Creating...", flush=True)
-    
-    # Create in Org
     payload = {"name": repo_name, "private": False}
     res = requests.post(f"https://api.github.com/orgs/{OWNER}/repos", headers=headers, json=payload)
-    
-    # Fallback to User
     if res.status_code not in [200, 201]:
         res = requests.post("https://api.github.com/user/repos", headers=headers, json=payload)
     
     if res.status_code in [200, 201]:
         print(f"✅ Created repo: {repo_name}", flush=True)
-        time.sleep(2)
+        time.sleep(3) # 전파 대기
 
 def run_git_cmd(cwd, args):
     subprocess.run(["git"] + args, cwd=cwd, check=True, capture_output=True)
 
 def setup_repo(repo_name, local_path):
+    """로컬 Git 초기화 및 동기화"""
     ensure_remote_repo(repo_name)
     if not local_path.exists(): local_path.mkdir(parents=True)
     
@@ -101,12 +97,9 @@ def setup_repo(repo_name, local_path):
             print(f"Repo setup error {repo_name}: {e}", flush=True)
 
 def sync_main_repo(msg_suffix=""):
-    """상태 파일 및 통계 파일 메인 저장소 동기화"""
+    """메인 저장소(상태 및 통계) 동기화"""
     try:
-        run_git_cmd(Path("."), ["config", "--global", "user.name", "github-actions[bot]"])
-        run_git_cmd(Path("."), ["config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com"])
         run_git_cmd(Path("."), ["add", "kalshi_state.json", "KALSHI_REPO_STATS.md"])
-        
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         if status.stdout.strip():
             ts = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -114,7 +107,7 @@ def sync_main_repo(msg_suffix=""):
             try: run_git_cmd(Path("."), ["pull", "--rebase", "origin", "main"])
             except: pass
             run_git_cmd(Path("."), ["push"])
-            print(" >> 📊 Main State Synced.", flush=True)
+            print(f" >> 📊 Stats Pushed ({msg_suffix})", flush=True)
     except Exception as e:
         print(f"Main sync failed: {e}", flush=True)
 
@@ -139,22 +132,15 @@ def get_unique_id(kind, data):
     return None
 
 def extract_year(data):
-    """
-    [복구된 기능] 데이터에서 연도를 추출합니다.
-    우선순위: open_date > created_time > 현재연도
-    """
     date_str = data.get('open_date') or data.get('created_time')
     if date_str:
-        try:
-            # ISO format (YYYY-MM-DD...)
-            return str(date_str)[:4]
-        except:
-            pass
-    return str(NOW_UTC.year) # Fallback
+        try: return str(date_str)[:4]
+        except: pass
+    return str(NOW_UTC.year)
 
 
 # ------------------------------------------------------------------------------
-# 4. RepoWriter Class
+# 4. RepoWriter Class (샤딩 로직 포함)
 # ------------------------------------------------------------------------------
 
 class RepoWriter:
@@ -165,24 +151,35 @@ class RepoWriter:
         setup_repo(repo_name, self.local_path)
 
     def get_file_count(self):
-        return len(list(self.local_path.glob("*.json")))
+        """디렉토리가 나뉘어 있으므로 재귀적으로 파일 수를 셉니다."""
+        return sum(len(files) for _, _, files in os.walk(self.local_path) if '.git' not in _)
 
-    def write_item(self, filename, data):
-        with open(self.local_path / filename, 'w', encoding='utf-8') as f:
+    def write_item(self, uid, data):
+        """
+        [복구된 기능] 디렉토리 샤딩(Sharding) 적용
+        UID의 앞 2글자를 디렉토리명으로 사용하여 파일 집중 현상 방지
+        """
+        filename = f"{uid}.json"
+        shard_dir = self.local_path / uid[:2].upper()
+        shard_dir.mkdir(exist_ok=True, parents=True)
+        
+        file_path = shard_dir / filename
+        with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         self.pending_count += 1
 
     def sync(self):
         if self.pending_count == 0: return
         try:
-            print(f"Syncing {self.repo_name} ({self.pending_count} changes)...", flush=True)
+            print(f"Syncing {self.repo_name}...", flush=True)
             run_git_cmd(self.local_path, ["add", "."])
             status = subprocess.run(["git", "status", "--porcelain"], cwd=self.local_path, capture_output=True, text=True)
             if status.stdout.strip():
                 ts = dt.datetime.now(dt.timezone.utc).isoformat()
-                run_git_cmd(self.local_path, ["commit", "-m", f"Data update: {ts}"])
-                try: run_git_cmd(self.local_path, ["push", "-u", "origin", "main"])
-                except: 
+                run_git_cmd(self.local_path, ["commit", "-m", f"Update data: {ts}"])
+                try:
+                    run_git_cmd(self.local_path, ["push", "-u", "origin", "main"])
+                except:
                     run_git_cmd(self.local_path, ["pull", "--rebase", "origin", "main"])
                     run_git_cmd(self.local_path, ["push", "-u", "origin", "main"])
             self.pending_count = 0
@@ -215,11 +212,10 @@ def run_crawl():
             cursor = state["cursors"].get(kind)
             
             while True:
-                # [복구된 기능] 시간 제한 체크 (Safe Exit)
-                elapsed = time.time() - START_TIME
-                if elapsed > (JOB_TIME_LIMIT_SEC - FINISH_BUFFER_SEC):
-                    print("⏳ Time limit approaching. Stopping gracefully.", flush=True)
-                    return # finally 블록으로 이동
+                # 안전 종료 체크
+                if (time.time() - START_TIME) > (JOB_TIME_LIMIT_SEC - FINISH_BUFFER_SEC):
+                    print("⏳ Time limit. Graceful stop.", flush=True)
+                    return
 
                 params = {"limit": 100}
                 if cursor: params["cursor"] = cursor
@@ -227,7 +223,7 @@ def run_crawl():
                 try:
                     resp = session.get(f"{BASE_URL}{endpoint}", params=params, timeout=20)
                     if resp.status_code == 429:
-                        time.sleep(5)
+                        time.sleep(10)
                         continue
                     resp.raise_for_status()
                     data = resp.json()
@@ -237,17 +233,13 @@ def run_crawl():
                     time.sleep(10)
                     continue
 
-                if not items:
-                    print(f"No more items for {kind}.", flush=True)
-                    break
+                if not items: break
 
                 for item in items:
                     uid = get_unique_id(kind, item)
                     if not uid: continue
                     
-                    # [수정] 동적 연도 추출
                     target_year = extract_year(item)
-                    
                     prefix = f"Statground_Data_Kalshi_{kind.capitalize()}s_{target_year}"
                     if kind == "series": prefix = "Statground_Data_Kalshi_Series"
                     
@@ -262,9 +254,9 @@ def run_crawl():
 
                     writer = writers[repo_name]
 
-                    # Rollover
+                    # Rollover 체크 (100만 개 기준)
                     if kind != "series" and writer.get_file_count() >= REPO_MAX_FILES:
-                        print(f"🔄 Rolling over {repo_name}", flush=True)
+                        print(f"🔄 Rolling over {repo_name} (Limit {REPO_MAX_FILES})", flush=True)
                         writer.sync()
                         del writers[repo_name]
                         
@@ -278,15 +270,17 @@ def run_crawl():
                         if repo_name not in state["repos_seen"]:
                             state["repos_seen"].append(repo_name)
 
-                    writer.write_item(f"{uid}.json", item)
+                    # 데이터 저장 (UID 전달)
+                    writer.write_item(uid, item)
 
+                    # 5,000개 마다 커밋 및 통계 갱신
                     if writer.pending_count >= COMMIT_EVERY_FILES:
                         writer.sync()
                         if stats_gen: 
                             try: stats_gen.update_stats()
                             except: pass
                         save_state(state)
-                        sync_main_repo(f"({kind})")
+                        sync_main_repo(f"{kind} {current_idx:03d}")
 
                 next_cursor = data.get("cursor")
                 if not next_cursor or next_cursor == cursor:
@@ -299,21 +293,17 @@ def run_crawl():
                 save_state(state)
                 time.sleep(0.1)
 
-    except KeyboardInterrupt:
-        print("Interrupted.", flush=True)
     except Exception as e:
         print(f"Unexpected Error: {e}", flush=True)
     finally:
-        print("Finalizing... syncing pending data.", flush=True)
+        print("Finalizing...", flush=True)
         for w in writers.values():
             w.sync()
-        
         if stats_gen: 
             try: stats_gen.update_stats()
             except: pass
-        
         save_state(state)
-        sync_main_repo("(Finished)")
+        sync_main_repo("Finished")
 
 if __name__ == "__main__":
     run_crawl()
