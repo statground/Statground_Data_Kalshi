@@ -1,5 +1,5 @@
 # 📊 Kalshi Pipeline Real-time Stats
-**마지막 갱신 (UTC):** 2026-01-31 04:36:36
+**마지막 갱신 (UTC):** 2026-01-31 04:39:03
 
 ## 🗄️ 데이터 저장소별 수집 현황
 | 저장소 명 | 파일 개수 (로컬 집계) | 상태 |
@@ -15,6 +15,6 @@
 | [Statground_Data_Kalshi_Markets_2026_004](https://github.com/statground/Statground_Data_Kalshi_Markets_2026_004) | `30,000` | 🟢 활성 |
 | [Statground_Data_Kalshi_Markets_2026_005](https://github.com/statground/Statground_Data_Kalshi_Markets_2026_005) | `30,000` | 🟢 활성 |
 | [Statground_Data_Kalshi_Markets_2026_006](https://github.com/statground/Statground_Data_Kalshi_Markets_2026_006) | `30,000` | 🟢 활성 |
-| [Statground_Data_Kalshi_Markets_2026_007](https://github.com/statground/Statground_Data_Kalshi_Markets_2026_007) | `24,000` | 🟢 활성 |
+| [Statground_Data_Kalshi_Markets_2026_007](https://github.com/statground/Statground_Data_Kalshi_Markets_2026_007) | `27,000` | 🟢 활성 |
 | [Statground_Data_Kalshi_Series](https://github.com/statground/Statground_Data_Kalshi_Series) | `8,212` | 🟢 활성 |
-| **전체 합계** | **`352,356`** | |
+| **전체 합계** | **`355,356`** | |
