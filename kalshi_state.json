@@ -1,11 +1,14 @@
 {
   "cursors": {
     "series": null,
-    "event": "CgYIwJ2HywYSHUtYTkNBQU1CU1BSRUFELTI2SkFOMDlOS1VNSUxX"
+    "event": "CgYIgJj0ygYSFEtYQlRDMTVNLTI2SkFOMDYwODE1"
   },
-  "rollover": {},
+  "rollover": {
+    "Statground_Data_Kalshi_Events_2026": 2
+  },
   "repos_seen": [
     "Statground_Data_Kalshi_Series",
-    "Statground_Data_Kalshi_Events_2026_001"
+    "Statground_Data_Kalshi_Events_2026_001",
+    "Statground_Data_Kalshi_Events_2026_002"
   ]
 }
