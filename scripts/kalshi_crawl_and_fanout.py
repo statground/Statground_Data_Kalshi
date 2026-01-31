@@ -21,7 +21,7 @@ except ImportError:
 # ------------------------------------------------------------------------------
 
 # [설정] 리포지토리 자동 분할 기준 (파일 수)
-# 사용자의 요청에 따라 100만 개로 상향 조정
+# 요청하신 대로 1,000,000(100만) 개로 상향 조정
 REPO_MAX_FILES = 1000000 
 
 # [설정] 커밋 및 통계 갱신 주기 (파일 수)
@@ -51,7 +51,7 @@ for d in [WORK_DIR, WORK_REPOS_DIR]:
 # ------------------------------------------------------------------------------
 
 def ensure_remote_repo(repo_name):
-    """GitHub 리포지토리가 없으면 자동으로 생성"""
+    """GitHub 리포지토리가 없으면 자동으로 생성 (삭제 대응 복구 로직)"""
     if not GH_PAT: return
 
     headers = {
@@ -59,28 +59,33 @@ def ensure_remote_repo(repo_name):
         "Accept": "application/vnd.github.v3+json"
     }
     
+    # 존재 여부 확인
     if requests.get(f"https://api.github.com/repos/{OWNER}/{repo_name}", headers=headers).status_code == 200:
         return
     
     print(f"⚠️ Repo '{OWNER}/{repo_name}' not found. Creating...", flush=True)
     payload = {"name": repo_name, "private": False}
+    
+    # Org 생성 시도 후 실패 시 개인 계정 생성 시도
     res = requests.post(f"https://api.github.com/orgs/{OWNER}/repos", headers=headers, json=payload)
     if res.status_code not in [200, 201]:
         res = requests.post("https://api.github.com/user/repos", headers=headers, json=payload)
     
     if res.status_code in [200, 201]:
         print(f"✅ Created repo: {repo_name}", flush=True)
-        time.sleep(3) # 전파 대기
+        time.sleep(3) # GitHub API 전파 대기
 
 def run_git_cmd(cwd, args):
+    """특정 경로에서 Git 명령어 실행"""
     subprocess.run(["git"] + args, cwd=cwd, check=True, capture_output=True)
 
 def setup_repo(repo_name, local_path):
-    """로컬 Git 초기화 및 동기화"""
+    """로컬 Git 저장소 초기화 및 원격지 연결"""
     ensure_remote_repo(repo_name)
     if not local_path.exists(): local_path.mkdir(parents=True)
     
     if not (local_path / ".git").exists():
+        print(f"Initializing local repo: {repo_name}", flush=True)
         try:
             run_git_cmd(local_path, ["init"])
             run_git_cmd(local_path, ["config", "user.name", "github-actions[bot]"])
@@ -97,19 +102,30 @@ def setup_repo(repo_name, local_path):
             print(f"Repo setup error {repo_name}: {e}", flush=True)
 
 def sync_main_repo(msg_suffix=""):
-    """메인 저장소(상태 및 통계) 동기화"""
+    """메인 저장소(상태파일, 통계파일) 동기화 - 경로 에러 해결 버전"""
     try:
-        run_git_cmd(Path("."), ["add", "kalshi_state.json", "KALSHI_REPO_STATS.md"])
-        status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        # 스크립트 위치 기준 프로젝트 루트 명시
+        project_root = Path(__file__).parent.parent 
+        
+        # Git 설정 재확인
+        run_git_cmd(project_root, ["config", "user.name", "github-actions[bot]"])
+        run_git_cmd(project_root, ["config", "user.email", "github-actions[bot]@users.noreply.github.com"])
+        
+        # 파일 존재 시 add
+        for f in ["kalshi_state.json", "KALSHI_REPO_STATS.md"]:
+            if (project_root / f).exists():
+                run_git_cmd(project_root, ["add", f])
+        
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=project_root, capture_output=True, text=True)
         if status.stdout.strip():
             ts = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            run_git_cmd(Path("."), ["commit", "-m", f"Update state: {ts} {msg_suffix} [skip ci]"])
-            try: run_git_cmd(Path("."), ["pull", "--rebase", "origin", "main"])
+            run_git_cmd(project_root, ["commit", "-m", f"Update state: {ts} {msg_suffix} [skip ci]"])
+            try: run_git_cmd(project_root, ["pull", "--rebase", "origin", "main"])
             except: pass
-            run_git_cmd(Path("."), ["push"])
-            print(f" >> 📊 Stats Pushed ({msg_suffix})", flush=True)
+            run_git_cmd(project_root, ["push", "origin", "main"])
+            print(f" >> 📊 Main Stats Updated.", flush=True)
     except Exception as e:
-        print(f"Main sync failed: {e}", flush=True)
+        print(f"⚠️ Main sync alert: {e}", flush=True)
 
 
 # ------------------------------------------------------------------------------
@@ -132,6 +148,7 @@ def get_unique_id(kind, data):
     return None
 
 def extract_year(data):
+    """데이터 필드에서 연도 동적 추출"""
     date_str = data.get('open_date') or data.get('created_time')
     if date_str:
         try: return str(date_str)[:4]
@@ -140,7 +157,7 @@ def extract_year(data):
 
 
 # ------------------------------------------------------------------------------
-# 4. RepoWriter Class (샤딩 로직 포함)
+# 4. RepoWriter Class (Sharding 구현)
 # ------------------------------------------------------------------------------
 
 class RepoWriter:
@@ -151,14 +168,11 @@ class RepoWriter:
         setup_repo(repo_name, self.local_path)
 
     def get_file_count(self):
-        """디렉토리가 나뉘어 있으므로 재귀적으로 파일 수를 셉니다."""
+        """재귀적으로 모든 JSON 파일 카운트"""
         return sum(len(files) for _, _, files in os.walk(self.local_path) if '.git' not in _)
 
     def write_item(self, uid, data):
-        """
-        [복구된 기능] 디렉토리 샤딩(Sharding) 적용
-        UID의 앞 2글자를 디렉토리명으로 사용하여 파일 집중 현상 방지
-        """
+        """디렉토리 샤딩 적용 (파일명 앞 2자리로 폴더 분리)"""
         filename = f"{uid}.json"
         shard_dir = self.local_path / uid[:2].upper()
         shard_dir.mkdir(exist_ok=True, parents=True)
@@ -212,9 +226,9 @@ def run_crawl():
             cursor = state["cursors"].get(kind)
             
             while True:
-                # 안전 종료 체크
+                # 안전 종료 체크 (시간 제한)
                 if (time.time() - START_TIME) > (JOB_TIME_LIMIT_SEC - FINISH_BUFFER_SEC):
-                    print("⏳ Time limit. Graceful stop.", flush=True)
+                    print("⏳ Time limit approaching. Stop gracefully.", flush=True)
                     return
 
                 params = {"limit": 100}
@@ -256,7 +270,7 @@ def run_crawl():
 
                     # Rollover 체크 (100만 개 기준)
                     if kind != "series" and writer.get_file_count() >= REPO_MAX_FILES:
-                        print(f"🔄 Rolling over {repo_name} (Limit {REPO_MAX_FILES})", flush=True)
+                        print(f"🔄 Rolling over {repo_name}...", flush=True)
                         writer.sync()
                         del writers[repo_name]
                         
@@ -270,13 +284,13 @@ def run_crawl():
                         if repo_name not in state["repos_seen"]:
                             state["repos_seen"].append(repo_name)
 
-                    # 데이터 저장 (UID 전달)
+                    # 데이터 저장 (ID 전달)
                     writer.write_item(uid, item)
 
-                    # 5,000개 마다 커밋 및 통계 갱신
+                    # 중간 커밋 및 실시간 통계 반영
                     if writer.pending_count >= COMMIT_EVERY_FILES:
                         writer.sync()
-                        if stats_gen: 
+                        if stats_gen:
                             try: stats_gen.update_stats()
                             except: pass
                         save_state(state)
@@ -296,10 +310,10 @@ def run_crawl():
     except Exception as e:
         print(f"Unexpected Error: {e}", flush=True)
     finally:
-        print("Finalizing...", flush=True)
+        print("Finalizing... syncing pending data.", flush=True)
         for w in writers.values():
             w.sync()
-        if stats_gen: 
+        if stats_gen:
             try: stats_gen.update_stats()
             except: pass
         save_state(state)
