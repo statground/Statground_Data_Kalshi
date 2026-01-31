@@ -1,9 +1,10 @@
 name: Kalshi Crawl + Fan-out
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 수동 실행 옵션
   schedule:
-    - cron: "0 15,21,3,9 * * *"
+    # [설정] 매 시 정각(0분)에 실행 (1시간 간격)
+    - cron: "0 * * * *"
 
 permissions:
   contents: write
@@ -15,8 +16,10 @@ jobs:
       - name: Checkout orchestrator
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Push 충돌 방지를 위해 전체 이력 필요
-          token: ${{ secrets.GH_PAT }} # 권한이 충분한 PAT 사용 권장
+          # 상태 파일 업데이트 후 Push를 위해 PAT 사용 권장
+          # (기본 GITHUB_TOKEN은 protected branch push나 연속 트리거에 제약이 있을 수 있음)
+          token: ${{ secrets.GH_PAT }} 
+          fetch-depth: 0 
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,8 +29,31 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Crawl & Stats
+      - name: Run Crawl & Fan-out Script
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_OWNER: "statground"
+          # 필요 시 KALSHI_BASE_URL 등 추가 환경변수 설정
         run: python scripts/kalshi_crawl_and_fanout.py
+
+      # [중요] 실행 후 변경된 커서(state)와 통계(md)를 현재 저장소에 반영
+      # 스크립트가 중간에 에러로 멈추더라도(always), 진행된 곳까지의 커서는 저장해야 함.
+      - name: Commit & Push State
+        if: always() 
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 변경된 파일 스테이징 (없으면 패스)
+          git add kalshi_state.json KALSHI_REPO_STATS.md
+          
+          # 변경사항 확인 후 커밋
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            timestamp=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            git commit -m "Update state & stats: $timestamp [skip ci]"
+            
+            # Push 시도 (충돌 방지를 위해 pull --rebase 사용 가능하나, 단일 워커라 바로 push)
+            git push
+          fi
