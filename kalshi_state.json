@@ -1,16 +1,17 @@
 {
   "cursors": {
     "series": null,
-    "event": "CgYI8LDVuwYSJUtYQ0lUSUVTV0VBVEhFUi0yNERFQzMxKERFTikoSE9VKShOWSk"
+    "event": "CgYIoPiGuwYSE0tYRVVSVVNESC0yNERFQzE3MTM"
   },
   "rollover": {
-    "Statground_Data_Kalshi_Events_2026": 4
+    "Statground_Data_Kalshi_Events_2026": 5
   },
   "repos_seen": [
     "Statground_Data_Kalshi_Series",
     "Statground_Data_Kalshi_Events_2026_001",
     "Statground_Data_Kalshi_Events_2026_002",
     "Statground_Data_Kalshi_Events_2026_003",
-    "Statground_Data_Kalshi_Events_2026_004"
+    "Statground_Data_Kalshi_Events_2026_004",
+    "Statground_Data_Kalshi_Events_2026_005"
   ]
 }
